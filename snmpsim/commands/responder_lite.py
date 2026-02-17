@@ -393,6 +393,12 @@ def main():
             var_binds = rsp_var_binds[-R:]
             M -= 1
 
+            if all(
+                getattr(val, 'tagSet', None) == rfc1905.EndOfMibView.tagSet
+                for _, val in var_binds
+            ):
+                break
+
         return rsp_var_binds
 
     def commandResponderCbFun(
