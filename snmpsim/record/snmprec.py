@@ -6,6 +6,8 @@
 #
 import bz2
 
+from pyasn1.type import univ
+
 from snmpsim import error
 from snmpsim.grammar import snmprec
 from snmpsim.record import dump
@@ -76,6 +78,15 @@ class SnmprecRecord(dump.DumpRecord):
 
         return unescaped
 
+    @staticmethod
+    def _validate_value(value):
+        """Reject values that cannot be BER-encoded."""
+        if isinstance(value, univ.ObjectIdentifier) and len(value) < 2:
+            raise error.SnmpsimError(
+                "short OID value %s (need at least 2 components)" % (value.prettyPrint(),)
+            )
+        return value
+
     def evaluate_value(self, oid, tag, value, **context):
         tag, encoding_id = self.unpack_tag(tag)
 
@@ -83,16 +94,16 @@ class SnmprecRecord(dump.DumpRecord):
             if encoding_id == "e":
                 value = self.evaluate_raw_string(value)
 
-                return oid, tag, self.grammar.TAG_MAP[tag](value)
+                return oid, tag, self._validate_value(self.grammar.TAG_MAP[tag](value))
 
             elif encoding_id == "x":
                 if isinstance(value, bytes):
                     value = value.decode("iso-8859-1")
 
-                return oid, tag, self.grammar.TAG_MAP[tag](hexValue=value)
+                return oid, tag, self._validate_value(self.grammar.TAG_MAP[tag](hexValue=value))
 
             else:
-                return oid, tag, self.grammar.TAG_MAP[tag](value)
+                return oid, tag, self._validate_value(self.grammar.TAG_MAP[tag](value))
 
         except Exception as exc:
             raise error.SnmpsimError(
