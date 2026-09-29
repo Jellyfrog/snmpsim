@@ -108,7 +108,11 @@ class DataFile(AbstractLayout):
                 exact_match = True
 
             except KeyError:
-                offset = search_record_by_oid(oid, text, self._text_parser)
+                offset = self._record_index.search(oid)
+
+                if offset is None:
+                    offset = search_record_by_oid(oid, text, self._text_parser)
+
                 subtree_flag = exact_match = False
 
             text.seek(offset)
@@ -123,13 +127,12 @@ class DataFile(AbstractLayout):
                         _next_line, _, _ = get_record(text)  # next line
 
                         if _next_line:
-                            _next_oid, _ = self._text_parser.evaluate(
-                                _next_line, oidOnly=True
-                            )
+                            # index keys are OIDs as the grammar parses them
+                            _next_oid = self._text_parser.grammar.parse(_next_line)[0]
 
                             try:
                                 _, subtree_flag, _ = self._record_index.lookup(
-                                    str(_next_oid)
+                                    _next_oid
                                 )
 
                             except KeyError:

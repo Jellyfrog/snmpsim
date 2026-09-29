@@ -167,3 +167,127 @@ def test_data_file_get_and_next(data_file):
     assert val.__class__.__name__ == "EndOfMibView"
 
     data.close()
+
+
+def test_search_matches_file_search(data_file):
+    from snmpsim.record.search.file import get_record
+    from snmpsim.record.search.file import search_record_by_oid
+
+    index = RecordIndex(data_file, PARSER).create()
+    index.open()
+
+    for oid in (
+        "0.0",
+        "1.3",
+        "1.3.6.1.2.1.1.1.0",
+        "1.3.6.1.2.1.1.2",
+        "1.3.6.1.2.1.1.3.0.1",
+        "1.3.6.1.2.1.2.0",
+        "1.3.6.1.2.1.2.1.0",
+        "1.3.6.1.2.1.3",
+        "2.1",
+    ):
+        oid = univ.ObjectIdentifier(oid)
+        offset = index.search(oid)
+
+        assert offset is not None
+
+        index._text.seek(offset)
+        found = get_record(index._text)[0]
+
+        index._text.seek(search_record_by_oid(oid, index._text, PARSER))
+        assert found == get_record(index._text)[0], oid
+
+    assert index.search(univ.ObjectIdentifier("2.1")) == len(RECORDS)
+
+    index.close()
+
+
+@pytest.mark.parametrize(
+    "records",
+    [
+        b"1.3.6.1.2.1.1.3.0|2|1\n1.3.6.1.2.1.1.1.0|2|1\n",
+        b"1.3.6.1.2.1.1.1.0|2|1\n1.3.6.1.2.1.1.1.0|2|2\n",
+    ],
+    ids=["out-of-order", "duplicate"],
+)
+def test_search_unavailable_for_unsorted_data(tmp_path, records):
+    path = tmp_path / "unsorted.snmprec"
+    path.write_bytes(records)
+
+    index = RecordIndex(str(path), PARSER).create()
+    index.open()
+
+    assert index.search(univ.ObjectIdentifier("1.3.6.1.2.1.1.2.0")) is None
+
+    index.close()
+
+
+def test_search(data_file):
+    index = RecordIndex(data_file, PARSER).create()
+    index.open()
+
+    def search(oid):
+        return index.search(univ.ObjectIdentifier(oid))
+
+    assert search("1.3.6.1.2.1.1.1.0") == offset_of("1.3.6.1.2.1.1.1.0")
+    assert search("1.3") == offset_of("1.3.6.1.2.1.1.1.0")
+    assert search("1.3.6.1.2.1.1.2") == offset_of("1.3.6.1.2.1.1.3.0")
+    assert search("1.3.6.1.2.1.2.0") == offset_of("1.3.6.1.2.1.2.1.0")
+    assert search("1.3.6.1.2.1.3") == len(RECORDS)
+
+    index.close()
+
+
+def test_search_falls_back_on_unordered_data(tmp_path):
+    path = tmp_path / "unordered.snmprec"
+    path.write_bytes(b"1.3.6.1.2.1.1.3.0|2|1\n1.3.6.1.2.1.1.1.0|2|1\n")
+
+    index = RecordIndex(str(path), PARSER).create()
+    index.open()
+    assert index.search(univ.ObjectIdentifier("1.3.6.1.2.1.1.2.0")) is None
+    index.close()
+
+
+def test_data_file_missing_oids(data_file):
+    data = datafile.DataFile(data_file, PARSER, {}).index_text()
+
+    ((oid, val),) = data.process_var_binds(
+        [(univ.ObjectIdentifier("1.3.6.1.2.1.1.2.0"), univ.Null(""))],
+        nextFlag=False,
+        setFlag=False,
+    )
+    assert val.__class__.__name__ == "NoSuchInstance"
+
+    ((oid, val),) = data.process_var_binds(
+        [(univ.ObjectIdentifier("1.3.6.1.2.1.1.2.0"), univ.Null(""))],
+        nextFlag=True,
+        setFlag=False,
+    )
+    assert str(oid) == "1.3.6.1.2.1.1.3.0"
+    assert int(val) == 12345
+
+    data.close()
+
+
+def test_modified_data_file_is_reopened(data_file, monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(database.time, "monotonic", lambda: clock[0])
+
+    index = RecordIndex(data_file, PARSER).create()
+    index.get_handles()
+
+    with open(data_file, "ab") as f:
+        f.write(b"1.3.6.1.2.1.3.0|2|1\n")
+    bump_mtime(data_file, 10)
+
+    # modification checks are rate limited
+    clock[0] += 0.5
+    _, db = index.get_handles()
+    assert "1.3.6.1.2.1.3.0" not in db
+
+    clock[0] += 1
+    _, db = index.get_handles()
+    assert "1.3.6.1.2.1.3.0" in db
+
+    index.close()

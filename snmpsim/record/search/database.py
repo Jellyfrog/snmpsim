@@ -5,15 +5,17 @@
 # License: https://www.pysnmp.com/snmpsim/license.html
 #
 
+import bisect
 import marshal
 import os
+import time
 
 from snmpsim import confdir
 from snmpsim import error
 from snmpsim import log
 
 # Bump whenever the on-disk index layout changes
-INDEX_VERSION = 1
+INDEX_VERSION = 2
 
 
 class RecordIndex:
@@ -42,8 +44,11 @@ class RecordIndex:
         )
 
         self._db = self._text = None
+        self._unique_oids = False
+        self._search_table = None
 
         self._text_file_time = 0
+        self._text_file_checked = 0
 
     def __str__(self):
         return "Data file {}, {}".format(
@@ -56,9 +61,15 @@ class RecordIndex:
 
     def get_handles(self):
         if self.is_open():
-            if self._text_file_time != os.stat(self._text_file)[8]:
-                log.info("Text file %s modified, closing" % self._text_file)
-                self.close()
+            now = time.monotonic()
+
+            # checking for modifications on every request is costly
+            if now - self._text_file_checked >= 1:
+                self._text_file_checked = now
+
+                if self._text_file_time != os.stat(self._text_file)[8]:
+                    log.info("Text file %s modified, closing" % self._text_file)
+                    self.close()
 
         if not self.is_open():
             self.create()
@@ -112,6 +123,7 @@ class RecordIndex:
         parse = self._text_parser.grammar.parse
 
         db = {}
+        unique_oids = True
         line_no = 0
         offset = 0
         prev_offset = -1
@@ -153,6 +165,9 @@ class RecordIndex:
                 # for lines serving subtrees, type is empty in tag field
                 subtree_flag = tag[0] == ":"
 
+                if oid in db:
+                    unique_oids = False
+
                 db[oid] = (offset, subtree_flag, prev_offset)
 
                 # not a subtree - no back reference
@@ -168,7 +183,7 @@ class RecordIndex:
 
         try:
             with open(tmp_file, "wb") as f:
-                marshal.dump((INDEX_VERSION, db), f)
+                marshal.dump((INDEX_VERSION, db, unique_oids), f)
 
             os.replace(tmp_file, self._db_file)
 
@@ -186,33 +201,85 @@ class RecordIndex:
     def lookup(self, oid):
         return self._db[oid]
 
+    def _build_search_table(self):
+        # duplicate OIDs share one index entry, the file search may differ
+        if not self._unique_oids:
+            return False
+
+        oids = []
+        offsets = []
+
+        for key, (offset, _, _) in self._db.items():
+            if key == "last":
+                continue
+
+            try:
+                oids.append(tuple(int(arc) for arc in key.split(".")))
+
+            except ValueError:
+                return False
+
+            offsets.append(offset)
+
+        # binary search needs strictly increasing OIDs
+        if any(a >= b for a, b in zip(oids, oids[1:])):
+            return False
+
+        offsets.append(self._db["last"][0])
+
+        return oids, offsets
+
+    def search(self, oid):
+        """Offset of the first record with OID not less than `oid`.
+
+        Returns None if the data file can not be searched in memory
+        (non-numeric, duplicate or out of order OIDs).
+        """
+        if self._search_table is None:
+            self._search_table = self._build_search_table()
+
+        if not self._search_table:
+            return None
+
+        oids, offsets = self._search_table
+
+        return offsets[bisect.bisect_left(oids, tuple(oid))]
+
     def _load(self):
+        """Returns (db, unique_oids) or None if the index is unusable"""
         try:
             with open(self._db_file, "rb") as f:
-                version, db = marshal.load(f)
+                payload = marshal.load(f)
 
         except (OSError, EOFError, ValueError, TypeError):
             return None
 
-        if version != INDEX_VERSION:
+        if (
+            not isinstance(payload, tuple)
+            or len(payload) != 3
+            or payload[0] != INDEX_VERSION
+        ):
             return None
 
-        return db
+        return payload[1:]
 
     def open(self):
-        db = self._load()
+        index = self._load()
 
-        if db is None:
+        if index is None:
             log.info("Index %s unreadable, rebuilding" % self._db_file)
             self._build(validate_data=False)
-            db = self._load()
+            index = self._load()
 
-            if db is None:
+            if index is None:
                 raise error.SnmpsimError(f"Failed to load index {self._db_file}")
 
         self._text = self._text_parser.open(self._text_file)
-        self._db = db
+        self._db, self._unique_oids = index
+        self._search_table = None
+        self._text_file_checked = time.monotonic()
 
     def close(self):
         self._text.close()
         self._db = self._text = None
+        self._search_table = None
