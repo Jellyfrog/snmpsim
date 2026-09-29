@@ -1,3 +1,4 @@
+import collections
 import marshal
 import os
 
@@ -367,3 +368,42 @@ def test_read_next_run_matches_chained_getnext(data_file, start, log_level):
 
     finally:
         log.set_level("info")
+
+
+def test_least_recently_used_data_files_are_closed(tmp_path, monkeypatch):
+    monkeypatch.setattr(datafile.DataFile, "opened_queue", collections.OrderedDict())
+    monkeypatch.setattr(datafile.DataFile, "opened_index_size", 0)
+    monkeypatch.setattr(datafile.DataFile, "max_queue_entries", 2)
+
+    data_files = []
+
+    for name in "abc":
+        path = tmp_path / f"{name}.snmprec"
+        path.write_bytes(RECORDS)
+        data_files.append(datafile.DataFile(str(path), PARSER, {}).index_text())
+
+    a, b, c = data_files
+
+    a.get_handles()
+    b.get_handles()
+    a.get_handles()  # b is now the least recently used
+    c.get_handles()
+
+    assert list(datafile.DataFile.opened_queue) == [a, c]
+    assert not b._record_index.is_open()
+    assert datafile.DataFile.opened_index_size == 2 * a._record_index.index_size()
+
+    # limited by the size of the loaded indices too
+    monkeypatch.setattr(
+        datafile.DataFile, "max_queue_index_size", a._record_index.index_size()
+    )
+
+    b.get_handles()
+
+    assert list(datafile.DataFile.opened_queue) == [b]
+    assert not a._record_index.is_open() and not c._record_index.is_open()
+
+    b.close()
+
+    assert not datafile.DataFile.opened_queue
+    assert datafile.DataFile.opened_index_size == 0

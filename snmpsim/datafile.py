@@ -6,6 +6,7 @@
 #
 # Simulation data file management tools
 #
+import collections
 import os
 import stat
 
@@ -34,8 +35,12 @@ class AbstractLayout:
 
 class DataFile(AbstractLayout):
     layout = "text"
-    opened_queue = []
-    max_queue_entries = 31  # max number of open text and index files
+    # open data files, least recently used first, with their index sizes
+    opened_queue = collections.OrderedDict()
+    opened_index_size = 0
+    max_queue_entries = 256  # max number of open text files
+    # loaded indices take about five times their on-disk size in memory
+    max_queue_index_size = 32 * 1024 * 1024  # bytes of on-disk index
 
     def __init__(self, textFile, textParser, variationModules):
         self._record_index = RecordIndex(textFile, textParser)
@@ -48,20 +53,38 @@ class DataFile(AbstractLayout):
         return self
 
     def close(self):
-        self._record_index.close()
+        size = DataFile.opened_queue.pop(self, None)
+
+        if size is not None:
+            DataFile.opened_index_size -= size
+
+        if self._record_index.is_open():
+            self._record_index.close()
 
     def get_handles(self):
+        queue = DataFile.opened_queue
+
         if not self._record_index.is_open():
-            if len(DataFile.opened_queue) > self.max_queue_entries:
-                log.info("Closing %s" % self)
-                DataFile.opened_queue[0].close()
-                del DataFile.opened_queue[0]
-
-            DataFile.opened_queue.append(self)
-
             log.info("Opening %s" % self)
 
-        return self._record_index.get_handles()
+        # may also reopen the data file if it has been modified
+        handles = self._record_index.get_handles()
+
+        size = self._record_index.index_size()
+
+        DataFile.opened_index_size += size - queue.pop(self, 0)
+        queue[self] = size
+
+        # the most recently used data file stays open regardless
+        while len(queue) > 1 and (
+            len(queue) > self.max_queue_entries
+            or DataFile.opened_index_size > self.max_queue_index_size
+        ):
+            data_file = next(iter(queue))
+            log.info("Closing %s" % data_file)
+            data_file.close()
+
+        return handles
 
     def process_var_binds(self, var_binds, **context):
         rsp_var_binds = []

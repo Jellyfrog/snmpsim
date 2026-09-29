@@ -44,6 +44,7 @@ class RecordIndex:
         )
 
         self._db = self._text = None
+        self._db_size = 0
         self._unique_oids = False
         self._search_table = None
 
@@ -200,6 +201,10 @@ class RecordIndex:
 
         log.info("...%d entries indexed" % line_no)
 
+    def index_size(self):
+        """On-disk size of the loaded index"""
+        return self._db_size
+
     def lookup(self, oid):
         return self._db[oid]
 
@@ -251,9 +256,10 @@ class RecordIndex:
         return offsets[bisect.bisect_left(oids, tuple(oid))]
 
     def _load(self):
-        """Returns (db, unique_oids) or None if the index is unusable"""
+        """Returns (size, db, unique_oids) or None if the index is unusable"""
         try:
             with open(self._db_file, "rb") as f:
+                size = os.fstat(f.fileno()).st_size
                 payload = marshal.load(f)
 
         except (OSError, EOFError, ValueError, TypeError):
@@ -266,7 +272,7 @@ class RecordIndex:
         ):
             return None
 
-        return payload[1:]
+        return size, *payload[1:]
 
     def open(self):
         index = self._load()
@@ -280,11 +286,12 @@ class RecordIndex:
                 raise error.SnmpsimError(f"Failed to load index {self._db_file}")
 
         self._text = self._text_parser.open(self._text_file)
-        self._db, self._unique_oids = index
+        self._db_size, self._db, self._unique_oids = index
         self._search_table = None
         self._text_file_checked = time.monotonic()
 
     def close(self):
         self._text.close()
         self._db = self._text = None
+        self._db_size = 0
         self._search_table = None
