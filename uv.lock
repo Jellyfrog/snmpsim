@@ -1218,6 +1218,10 @@ dev = [
     { name = "sphinx-sitemap-lextudio" },
     { name = "tomli", marker = "python_full_version < '3.11'" },
 ]
+full = [
+    { name = "cryptography" },
+    { name = "pysmi" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1225,10 +1229,12 @@ requires-dist = [
     { name = "bump2version", marker = "extra == 'dev'" },
     { name = "codecov", marker = "extra == 'dev'" },
     { name = "cryptography", marker = "extra == 'dev'" },
+    { name = "cryptography", marker = "extra == 'full'" },
     { name = "doc8", marker = "extra == 'dev'" },
     { name = "furo", marker = "extra == 'dev'" },
     { name = "pre-commit", marker = "extra == 'dev'" },
     { name = "pysmi", marker = "extra == 'dev'" },
+    { name = "pysmi", marker = "extra == 'full'" },
     { name = "pysnmp", specifier = ">=7.1.26" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-asyncio", marker = "extra == 'dev'" },
@@ -1240,7 +1246,7 @@ requires-dist = [
     { name = "sphinx-sitemap-lextudio", marker = "extra == 'dev'" },
     { name = "tomli", marker = "python_full_version < '3.11' and extra == 'dev'" },
 ]
-provides-extras = ["dev"]
+provides-extras = ["full", "dev"]
 
 [[package]]
 name = "snowballstemmer"

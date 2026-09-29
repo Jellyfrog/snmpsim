@@ -60,6 +60,11 @@ include = [
 ]
 
 [project.optional-dependencies]
+# SNMPv3 privacy and MIB compilation support
+full = [
+    "cryptography",
+    "pysmi",
+]
 dev = [
     "codecov",
     "cryptography",

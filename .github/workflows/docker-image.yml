@@ -1,0 +1,41 @@
+name: Create and publish Docker images
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  # Docker's reusable builder runs each platform natively on its own runner
+  # (no QEMU), pushes by digest and merges them into a multi-arch manifest.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: snmpsim
+            image: ghcr.io/${{ github.repository }}
+          - target: snmptrapd
+            image: ghcr.io/${{ github.repository }}-snmptrapd
+    uses: docker/github-builder/.github/workflows/build.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
+    permissions:
+      contents: read
+      packages: write # to push to ghcr.io
+      id-token: write # for signing attestations and cache entries with GitHub OIDC
+    with:
+      output: image
+      push: true
+      target: ${{ matrix.target }}
+      platforms: linux/amd64,linux/arm64
+      runner: |
+        default=ubuntu-26.04
+        linux/arm64=ubuntu-26.04-arm
+      cache: true
+      cache-mode: max
+      meta-images: ${{ matrix.image }}
+      set-meta-labels: true
+    secrets:
+      registry-auths: |
+        - registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}

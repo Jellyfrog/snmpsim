@@ -1,0 +1,10 @@
+# Allowlist: only what the Dockerfile needs.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE.txt
+!snmpsim
+!docker/data
+!docker/snmptrapd.py
+**/__pycache__
