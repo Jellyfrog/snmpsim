@@ -381,7 +381,7 @@ def main():
 
                 else:
                     data_file = datafile.DataFile(
-                        full_path, text_parser, variation_modules
+                        full_path, text_parser, variation_modules, preEncode=True
                     )
                     data_file.index_text(
                         args.force_index_rebuild and full_path not in indexed,

@@ -34,8 +34,57 @@ _OCTET_TAGS = frozenset((0x04, 0x40, 0x44))
 _EMPTY_TAGS = frozenset((0x05, 0x80, 0x81, 0x82))
 
 
+# snmprec tag -> (BER tag, min value, max value + 1)
+_RECORD_INTEGERS = {
+    "2": (0x02, -(2**31), 2**31),  # Integer32
+    "65": (0x41, 0, 2**32),  # Counter32
+    "66": (0x42, 0, 2**32),  # Gauge32
+    "67": (0x43, 0, 2**32),  # TimeTicks
+    "70": (0x46, 0, 2**64),  # Counter64
+}
+
+# snmprec tag -> (BER tag, max size, whether hex encoded)
+_RECORD_OCTETS = {
+    "4": (0x04, 65535, False),  # OctetString
+    "4x": (0x04, 65535, True),
+    "68": (0x44, None, False),  # Opaque
+    "68x": (0x44, None, True),
+}
+
+
 class Unsupported(Exception):
     """Message is not handled by this codec, use pyasn1 instead"""
+
+
+class EncodedVarBind:
+    """Var-bind BER-encoded straight from a data file record.
+
+    Unpacks as an (oid, value) pair of pyasn1 objects, built on first
+    use by calling `evaluate`, so it can stand in for a plain var-bind.
+    """
+
+    __slots__ = ("key", "encoded", "_evaluate", "_var_bind")
+
+    def __init__(self, key, encoded, evaluate):
+        self.key = key  # OID as text, as in the data file index
+        self.encoded = encoded
+        self._evaluate = evaluate
+        self._var_bind = None
+
+    def _get(self):
+        if self._var_bind is None:
+            self._var_bind = self._evaluate()
+
+        return self._var_bind
+
+    def __iter__(self):
+        return iter(self._get())
+
+    def __getitem__(self, idx):
+        return self._get()[idx]
+
+    def __len__(self):
+        return 2
 
 
 def _header(data, idx, expected_tag=None):
@@ -188,27 +237,63 @@ def _encode_integer(value):
     return value.to_bytes(value.bit_length() // 8 + 1, "big", signed=True)
 
 
+def _encode_arc(arc):
+    if arc < 0x80:
+        return bytes((arc,))
+
+    chunk = [arc & 0x7F]
+    arc >>= 7
+
+    while arc:
+        chunk.append(0x80 | (arc & 0x7F))
+        arc >>= 7
+
+    return bytes(reversed(chunk))
+
+
+# encoded sub-identifiers, by value and by text, most OIDs only have small ones
+_ARCS = {arc: _encode_arc(arc) for arc in range(0x4000)}
+_TEXT_ARCS = {str(arc): octets for arc, octets in _ARCS.items()}
+# the first two sub-identifiers are encoded as one
+_TEXT_HEADS = {
+    (str(arc // 40), str(arc % 40)) if arc < 80 else ("2", str(arc - 80)): octets
+    for arc, octets in _ARCS.items()
+}
+
+
 def _encode_oid(arcs):
     if len(arcs) < 2 or arcs[0] > 2 or (arcs[0] < 2 and arcs[1] > 39):
         raise Unsupported("unusual object identifier")
 
-    octets = bytearray()
+    arcs = (arcs[0] * 40 + arcs[1], *arcs[2:])
 
-    for arc in (arcs[0] * 40 + arcs[1], *arcs[2:]):
-        if arc < 0x80:
-            octets.append(arc)
-            continue
+    try:
+        return b"".join(map(_ARCS.__getitem__, arcs))
 
-        chunk = [arc & 0x7F]
-        arc >>= 7
+    except KeyError:
+        return b"".join(map(_encode_arc, arcs))
 
-        while arc:
-            chunk.append(0x80 | (arc & 0x7F))
-            arc >>= 7
 
-        octets.extend(reversed(chunk))
+def _encode_text_oid(oid):
+    """Encode OID given in the dotted form pyasn1 prints, e.g. "1.3.6.1".
 
-    return bytes(octets)
+    Raises Unsupported for other forms, like leading zeros or dots.
+    """
+    arcs = oid.split(".")
+
+    try:
+        return _TEXT_HEADS[arcs[0], arcs[1]] + b"".join(
+            map(_TEXT_ARCS.__getitem__, arcs[2:])
+        )
+
+    except (KeyError, IndexError):
+        pass
+
+    for arc in arcs:
+        if not (arc.isascii() and arc.isdigit()) or (arc[0] == "0" and arc != "0"):
+            raise Unsupported("unusual object identifier")
+
+    return _encode_oid(tuple(map(int, arcs)))
 
 
 def encode_value(value):
@@ -238,13 +323,97 @@ def encode_value(value):
     return encoder.encode(value)
 
 
+def _encode_record_value(tag, value):
+    spec = _RECORD_INTEGERS.get(tag)
+
+    if spec:
+        ber_tag, low, high = spec
+        number = int(value)
+
+        if not low <= number < high:
+            return
+
+        return _encode_tlv(ber_tag, _encode_integer(number))
+
+    spec = _RECORD_OCTETS.get(tag)
+
+    if spec:
+        ber_tag, max_size, hex_encoded = spec
+        octets = bytes.fromhex(value) if hex_encoded else value.encode("iso-8859-1")
+
+        if max_size is not None and len(octets) > max_size:
+            return
+
+        return _encode_tlv(ber_tag, octets)
+
+    if tag == "64":  # IpAddress
+        # four characters are taken as raw octets by pysnmp
+        if len(value) == 4:
+            return
+
+        octets = bytes(int(x) for x in value.split("."))
+
+    elif tag == "64x":
+        octets = bytes.fromhex(value)
+
+    elif tag == "6":  # ObjectIdentifier
+        if "-" in value:
+            return
+
+        try:
+            return _encode_tlv(_OBJECT_IDENTIFIER, _encode_text_oid(value))
+
+        except Unsupported:
+            # pyasn1 also takes e.g. empty sub-identifiers
+            arcs = tuple(int(x) for x in value.split(".") if x)
+
+            return _encode_tlv(_OBJECT_IDENTIFIER, _encode_oid(arcs))
+
+    elif tag == "5" and not value:  # Null
+        return bytes((_NULL, 0))
+
+    else:
+        return
+
+    if len(octets) == 4:
+        return _encode_tlv(0x40, octets)
+
+
+def encode_record(oid, tag, value):
+    """BER-encode a var-bind from the fields of a plain snmprec record.
+
+    Returns None for records needing the full pyasn1 based evaluation,
+    e.g. variation module references, rare types or invalid values.
+    """
+    # only OIDs in canonical form, those are the index keys pyasn1 OIDs map to
+    try:
+        encoded_value = _encode_record_value(tag, value)
+
+        if encoded_value is None:
+            return
+
+        return _encode_tlv(
+            _SEQUENCE,
+            _encode_tlv(_OBJECT_IDENTIFIER, _encode_text_oid(oid)) + encoded_value,
+        )
+
+    except (Unsupported, ValueError):
+        return
+
+
 def encode_response(
     version, community, request_id, error_status, error_index, var_binds
 ):
     """Encode SNMP v1/v2c GetResponse message"""
     encoded_var_binds = []
 
-    for oid, value in var_binds:
+    for var_bind in var_binds:
+        if type(var_bind) is EncodedVarBind:
+            encoded_var_binds.append(var_bind.encoded)
+            continue
+
+        oid, value = var_bind
+
         if not isinstance(oid, univ.ObjectIdentifier):
             oid = univ.ObjectIdentifier(oid)
 

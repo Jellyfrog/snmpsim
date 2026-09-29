@@ -8,6 +8,7 @@ from pyasn1.type import univ
 from snmpsim import confdir
 from snmpsim import datafile
 from snmpsim import error
+from snmpsim import fastber
 from snmpsim import log
 from snmpsim import variation
 from snmpsim.record.search import database
@@ -338,16 +339,20 @@ def test_build_indices_reports_broken_data(tmp_path, monkeypatch):
         datafile.build_indices([(str(good), PARSER, "g"), (str(broken), PARSER, "b")])
 
 
+@pytest.mark.parametrize("pre_encode", [False, True])
 @pytest.mark.parametrize("log_level", ["error", "info"])
 @pytest.mark.parametrize(
     "start",
     ["1.3", "1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.2", "1.3.6.1.2.1.2", "1.3.6.1.2.1.3"],
 )
-def test_read_next_run_matches_chained_getnext(data_file, start, log_level):
+def test_read_next_run_matches_chained_getnext(data_file, start, log_level, pre_encode):
     log.set_level(log_level)
 
     try:
-        data = datafile.DataFile(data_file, PARSER, {}).index_text()
+        reference = datafile.DataFile(data_file, PARSER, {}).index_text()
+        data = datafile.DataFile(
+            data_file, PARSER, {}, preEncode=pre_encode
+        ).index_text()
         ctx = {"nextFlag": True, "setFlag": False}
 
         def render(var_binds):
@@ -357,17 +362,59 @@ def test_read_next_run_matches_chained_getnext(data_file, start, log_level):
         var_bind = (univ.ObjectIdentifier(start), univ.Null(""))
 
         for _ in range(8):
-            (var_bind,) = data.process_var_binds([var_bind], **ctx)
+            (var_bind,) = reference.process_var_binds([var_bind], **ctx)
             expected.append(var_bind)
 
         run = data.read_next_run(univ.ObjectIdentifier(start), univ.Null(""), 8, **ctx)
 
+        assert fastber.encode_response(1, b"x", 1, 0, 0, run) == (
+            fastber.encode_response(1, b"x", 1, 0, 0, expected)
+        )
         assert render(run) == render(expected)
 
+        reference.close()
         data.close()
 
     finally:
         log.set_level("info")
+
+
+@pytest.mark.parametrize("next_flag", [False, True])
+def test_pre_encoded_var_binds(data_file, next_flag):
+    reference = datafile.DataFile(data_file, PARSER, {}).index_text()
+    data = datafile.DataFile(data_file, PARSER, {}, preEncode=True).index_text()
+    ctx = {"nextFlag": next_flag, "setFlag": False}
+
+    var_binds = [
+        (univ.ObjectIdentifier(oid), univ.Null(""))
+        for oid in (
+            "1.3",
+            "1.3.6.1.2.1.1.1.0",
+            "1.3.6.1.2.1.1.2.0",
+            "1.3.6.1.2.1.1.3.0",
+            "1.3.6.1.2.1.2",
+            "1.3.6.1.2.1.2.1.0",
+            "1.3.6.1.2.1.3",
+        )
+    ]
+
+    expected = reference.process_var_binds(var_binds, **ctx)
+    response = data.process_var_binds(var_binds, **ctx)
+
+    assert any(type(vb) is fastber.EncodedVarBind for vb in response)
+    assert fastber.encode_response(1, b"x", 1, 0, 0, response) == (
+        fastber.encode_response(1, b"x", 1, 0, 0, expected)
+    )
+
+    # pre-encoded var-binds are taken as requested ones too
+    assert fastber.encode_response(
+        1, b"x", 1, 0, 0, data.process_var_binds(response, **ctx)
+    ) == fastber.encode_response(
+        1, b"x", 1, 0, 0, reference.process_var_binds(expected, **ctx)
+    )
+
+    reference.close()
+    data.close()
 
 
 def test_least_recently_used_data_files_are_closed(tmp_path, monkeypatch):

@@ -7,6 +7,7 @@
 # Simulation data file management tools
 #
 import collections
+import functools
 import os
 import stat
 
@@ -17,6 +18,7 @@ from pysnmp.smi import exval
 from pysnmp.smi.error import MibOperationError
 
 from snmpsim import confdir
+from snmpsim import fastber
 from snmpsim import log
 from snmpsim import variation
 from snmpsim.error import NoDataNotification
@@ -42,11 +44,15 @@ class DataFile(AbstractLayout):
     # loaded indices take about five times their on-disk size in memory
     max_queue_index_size = 32 * 1024 * 1024  # bytes of on-disk index
 
-    def __init__(self, textFile, textParser, variationModules):
+    def __init__(self, textFile, textParser, variationModules, preEncode=False):
         self._record_index = RecordIndex(textFile, textParser)
         self._text_parser = textParser
         self._text_file = textFile
         self._variation_modules = variationModules
+        # respond with fastber.EncodedVarBind for plain snmprec records
+        self._pre_encode = preEncode and isinstance(
+            textParser, variation.SnmprecRecordMixIn
+        )
 
     def index_text(self, forceIndexBuild=False, validateData=False):
         self._record_index.create(forceIndexBuild, validateData)
@@ -124,14 +130,26 @@ class DataFile(AbstractLayout):
                 )
             )
 
-        for oid, val in var_binds:
-            text_oid = ".".join(map(str, oid))
+        pre_encode = self._pre_encode and not context.get("setFlag")
+
+        for var_bind in var_binds:
+            if type(var_bind) is fastber.EncodedVarBind:
+                # spare building pyasn1 objects unless needed below
+                text_oid = var_bind.key
+                oid = val = None
+
+            else:
+                oid, val = var_bind
+                text_oid = ".".join(map(str, oid))
 
             try:
                 offset, subtree_flag, prev_offset = self._record_index.lookup(text_oid)
                 exact_match = True
 
             except KeyError:
+                if oid is None:
+                    oid, val = var_bind
+
                 offset = self._record_index.search(oid)
 
                 if offset is None:
@@ -202,9 +220,17 @@ class DataFile(AbstractLayout):
                                 line = _prev_line
                                 subtree_flag = True
 
+                if pre_encode and line and (exact_match or context.get("nextFlag")):
+                    _var_bind = self._encode_plain(line)
+
+                    if _var_bind:
+                        break
+
+                if oid is None:
+                    oid, val = var_bind
+
                 if not line:
-                    _oid = oid
-                    _val = error_status
+                    _var_bind = oid, error_status
                     break
 
                 call_context = context.copy()
@@ -222,9 +248,9 @@ class DataFile(AbstractLayout):
                 )
 
                 try:
-                    _oid, _val = self._text_parser.evaluate(line, **call_context)
+                    _var_bind = self._text_parser.evaluate(line, **call_context)
 
-                    if _val is exval.endOfMib:
+                    if _var_bind[1] is exval.endOfMib:
                         exact_match = True
                         subtree_flag = False
                         continue
@@ -236,14 +262,13 @@ class DataFile(AbstractLayout):
                     raise
 
                 except Exception as exc:
-                    _oid = oid
-                    _val = error_status
+                    _var_bind = oid, error_status
                     err_total += 1
                     log.error(f"data error at {self} for {text_oid}: {exc}")
 
                 break
 
-            rsp_var_binds.append((_oid, _val))
+            rsp_var_binds.append(_var_bind)
 
         if log.enabled(log.LOG_INFO):
             log.info(
@@ -266,13 +291,38 @@ class DataFile(AbstractLayout):
 
         return rsp_var_binds
 
-    def _read_next_plain(self, text, oid, val, context):
-        """GETNEXT for `oid` by reading the following record directly.
+    def _encode_plain(self, line, fields=None):
+        """Pre-encoded var-bind for a plain snmprec record or None"""
+        key, tag, value = fields or self._text_parser.grammar.parse(line)
 
-        Only handles `oid` matching a plain record followed by another
+        encoded = fastber.encode_record(key, tag, value)
+
+        if encoded is not None:
+            return fastber.EncodedVarBind(
+                key,
+                encoded,
+                functools.partial(
+                    self._text_parser.evaluate,
+                    line,
+                    nextFlag=True,
+                    exactMatch=True,
+                    setFlag=False,
+                ),
+            )
+
+    def _read_next_plain(self, text, var_bind, context):
+        """GETNEXT for `var_bind` by reading the following record directly.
+
+        Only handles OIDs matching a plain record followed by another
         plain record, returns None otherwise.
         """
-        entry = self._record_index.get(".".join(map(str, oid)))
+        if type(var_bind) is fastber.EncodedVarBind:
+            key = var_bind.key
+
+        else:
+            key = ".".join(map(str, var_bind[0]))
+
+        entry = self._record_index.get(key)
 
         if entry is None or entry[1]:  # not found or serving a subtree
             return
@@ -283,9 +333,11 @@ class DataFile(AbstractLayout):
         line, _, _ = get_record(text)
 
         if not line:
-            return
+            # end of data, as process_var_binds() responds
+            return var_bind[0], exval.endOfMib
 
-        key, tag, _ = self._text_parser.grammar.parse(line)
+        fields = self._text_parser.grammar.parse(line)
+        key, tag, _ = fields
 
         if ":" in tag:  # variation module or subtree
             return
@@ -294,6 +346,12 @@ class DataFile(AbstractLayout):
 
         if entry is None or entry[1]:
             return
+
+        if self._pre_encode:
+            # None for unusual records, process_var_binds() handles these
+            return self._encode_plain(line, fields)
+
+        oid, val = var_bind
 
         call_context = context.copy()
         call_context.update(
@@ -338,26 +396,37 @@ class DataFile(AbstractLayout):
             text = None
 
         run = []
+        var_bind = oid, val
+        plain_count = 0
 
         for _ in range(count):
-            var_bind = text and self._read_next_plain(text, oid, val, context)
+            next_var_bind = text and self._read_next_plain(text, var_bind, context)
 
-            if var_bind:
-                ReportingManager.update_metrics(
-                    data_file=self._text_file,
-                    varbind_count=1,
-                    datafile_call_count=1,
-                    datafile_failure_count=0,
-                    transport_call_count=1,
-                    **context,
-                )
-
-                run.append(var_bind)
+            if next_var_bind:
+                plain_count += 1
 
             else:
-                run.extend(self.process_var_binds([(oid, val)], **context))
+                (next_var_bind,) = self.process_var_binds([var_bind], **context)
 
-            oid, val = run[-1]
+                # the data file may have been reopened
+                try:
+                    text, _ = self.get_handles()
+
+                except SnmpsimError:
+                    text = None
+
+            run.append(next_var_bind)
+            var_bind = next_var_bind
+
+        if plain_count:
+            ReportingManager.update_metrics(
+                data_file=self._text_file,
+                varbind_count=plain_count,
+                datafile_call_count=plain_count,
+                datafile_failure_count=0,
+                transport_call_count=plain_count,
+                **context,
+            )
 
         return run
 

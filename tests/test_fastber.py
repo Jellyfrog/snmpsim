@@ -10,6 +10,7 @@ from pysnmp.proto import rfc1902
 from pysnmp.proto import rfc1905
 
 from snmpsim import fastber
+from snmpsim import variation
 from snmpsim.record.snmprec import SnmprecRecord
 
 V1, V2C = api.SNMP_VERSION_1, api.SNMP_VERSION_2C
@@ -132,7 +133,9 @@ def test_decode_empty_var_binds():
         pytest.param(
             build_request(V2C, fastber.GET_REQUEST, OIDS) * 2, id="two-messages"
         ),
-        pytest.param(build_request(V2C, fastber.GET_REQUEST, OIDS)[:-3], id="truncated"),
+        pytest.param(
+            build_request(V2C, fastber.GET_REQUEST, OIDS)[:-3], id="truncated"
+        ),
         pytest.param(
             build_request(V2C, fastber.GET_REQUEST, OIDS).replace(
                 b"\x02\x01\x01", b"\x02\x01\x03", 1
@@ -140,7 +143,8 @@ def test_decode_empty_var_binds():
             id="snmpv3",
         ),
         pytest.param(
-            bytes.fromhex("3080020101040670756274696300a000020100000000"), id="indefinite"
+            bytes.fromhex("3080020101040670756274696300a000020100000000"),
+            id="indefinite",
         ),
     ],
 )
@@ -227,7 +231,9 @@ def test_encode_value(value):
 @pytest.mark.parametrize("request_id", [0, 300, -5, 2**31 - 1])
 def test_encode_response(version, request_id):
     values = [v for v in VALUES if version == V2C or v.tagSet[0].tagClass != 0x80]
-    values = [v for v in values if version == V2C or not isinstance(v, rfc1902.Counter64)]
+    values = [
+        v for v in values if version == V2C or not isinstance(v, rfc1902.Counter64)
+    ]
     var_binds = [
         (univ.ObjectIdentifier(OIDS[i % len(OIDS)]), v) for i, v in enumerate(values)
     ]
@@ -294,3 +300,106 @@ def test_decoded_request_matches_pysnmp():
         int(p_mod.apiBulkPDU.get_max_repetitions(pdu)),
     )
     assert oids == [tuple(vb[0]) for vb in p_mod.apiPDU.get_varbinds(pdu)]
+
+
+def reference_var_bind(line):
+    oid, value = variation.RECORD_TYPES["snmprec"].evaluate(
+        line, nextFlag=True, exactMatch=True, setFlag=False
+    )
+
+    return encoder.encode(
+        univ.Sequence()
+        .setComponentByPosition(0, oid)
+        .setComponentByPosition(1, value, verifyConstraints=False)
+    )
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        b"1.3.6.1.2.1.1.1.0|4|Linux box",
+        b"1.3.6.1.2.1.1.1.0|4|",
+        b"1.3.6.1.2.1.1.1.0|4|" + bytes(range(128, 256)),
+        b"1.3.6.1.2.1.1.1.0|4x|00ff10",
+        b"1.3.6.1.2.1.1.1.0|4x|",
+        b"1.3.6.1.2.1.2.2.1.1.1|2|-2147483648",
+        b"1.3.6.1.2.1.2.2.1.1.1|2|2147483647",
+        b"1.3.6.1.2.1.2.2.1.1.1|2|0",
+        b"1.3.6.1.2.1.2.2.1.10.1|65|4294967295",
+        b"1.3.6.1.2.1.2.2.1.5.1|66|1000000000",
+        b"1.3.6.1.2.1.1.3.0|67|12345",
+        b"1.3.6.1.2.1.31.1.1.1.6.1|70|18446744073709551615",
+        b"1.3.6.1.2.1.1.2.0|6|1.3.6.1.4.1.9.1.2494",
+        b"1.3.6.1.2.1.1.2.0|6|.1.3.6.1.4.1.9",
+        b"1.3.6.1.2.1.1.2.0|6|0.0",
+        b"1.3.6.1.2.1.4.20.1.1.10.0.0.1|64|10.0.0.1",
+        b"1.3.6.1.2.1.4.20.1.1.10.0.0.1|64x|0a000001",
+        b"1.3.6.1.2.1.1.9.0|68|opaque",
+        b"1.3.6.1.2.1.1.9.0|68x|9f78",
+        b"1.3.6.1.2.1.1.9.0|5|",
+        b"1.3.6.1.4.1.20408.999.16383.16384.4294967295.1|4|large sub-identifiers",
+        b"2.999.3|4|joint",
+    ],
+)
+def test_encode_record(line):
+    oid, tag, value = SnmprecRecord.grammar.parse(line)
+
+    assert fastber.encode_record(oid, tag, value) == reference_var_bind(line)
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        # needing variation modules or the full evaluation
+        b"1.3.6.1.2.1.1.1.0|4:writecache|x",
+        b"1.3.6.1.2.1.1.1.0|4e|a\\x00b",
+        b"1.3.6.1.2.1.1.1.0|40|x",
+        # OIDs which do not print that way, so are not index keys
+        b".1.3.6.1.2.1.1.1.0|4|x",
+        b"1.3.6.1.2.1.1.01.0|4|x",
+        b"1|4|x",
+        # invalid values
+        b"1.3.6.1.2.1.2.2.1.1.1|2|",
+        b"1.3.6.1.2.1.2.2.1.1.1|2|2147483648",
+        b"1.3.6.1.2.1.2.2.1.10.1|65|-1",
+        b"1.3.6.1.2.1.31.1.1.1.6.1|70|18446744073709551616",
+        b"1.3.6.1.2.1.1.1.0|4x|0",
+        b"1.3.6.1.2.1.1.1.0|4|" + b"x" * 65536,
+        b"1.3.6.1.2.1.4.20.1.1.10.0.0.1|64|10.0.0",
+        b"1.3.6.1.2.1.4.20.1.1.10.0.0.1|64|10.0.0.256",
+        b"1.3.6.1.2.1.4.20.1.1.10.0.0.1|64|abcd",
+        b"1.3.6.1.2.1.4.20.1.1.10.0.0.1|64x|0a0000",
+        b"1.3.6.1.2.1.1.2.0|6|1.3.-6",
+        b"1.3.6.1.2.1.1.9.0|5|x",
+    ],
+)
+def test_encode_record_unsupported(line):
+    oid, tag, value = SnmprecRecord.grammar.parse(line)
+
+    assert fastber.encode_record(oid, tag, value) is None
+
+
+def test_encoded_var_bind_in_response():
+    line = b"1.3.6.1.2.1.1.3.0|67|12345"
+    oid, tag, value = SnmprecRecord.grammar.parse(line)
+    calls = []
+
+    def evaluate():
+        calls.append(1)
+        return univ.ObjectIdentifier(oid), rfc1902.TimeTicks(12345)
+
+    var_bind = fastber.EncodedVarBind(
+        oid, fastber.encode_record(oid, tag, value), evaluate
+    )
+    plain = [(univ.ObjectIdentifier(oid), rfc1902.TimeTicks(12345))]
+
+    assert fastber.encode_response(
+        V2C, b"public", 1, 0, 0, [var_bind]
+    ) == fastber.encode_response(V2C, b"public", 1, 0, 0, plain)
+    assert not calls
+
+    # unpacks as a plain var-bind, evaluated once
+    assert tuple(var_bind) == plain[0]
+    assert (var_bind[0], var_bind[1]) == plain[0]
+    assert len(var_bind) == 2
+    assert calls == [1]
