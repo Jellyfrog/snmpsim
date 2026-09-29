@@ -89,7 +89,15 @@ class SnmprecRecord(dump.DumpRecord):
                 if isinstance(value, bytes):
                     value = value.decode("iso-8859-1")
 
-                return oid, tag, self.grammar.TAG_MAP[tag](hexValue=value)
+                try:
+                    # much faster than pyasn1's hexValue parsing
+                    value = bytes.fromhex(value)
+
+                except ValueError:
+                    # e.g. odd length, let pyasn1 handle it as before
+                    return oid, tag, self.grammar.TAG_MAP[tag](hexValue=value)
+
+                return oid, tag, self.grammar.TAG_MAP[tag](value)
 
             else:
                 return oid, tag, self.grammar.TAG_MAP[tag](value)

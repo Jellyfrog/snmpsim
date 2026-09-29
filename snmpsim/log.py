@@ -285,6 +285,11 @@ msg = lambda x: None
 log_level = LOG_INFO
 
 
+def enabled(level):
+    """Whether messages of this level are logged, to skip costly formatting"""
+    return log_level <= level
+
+
 def error(message, ctx=""):
     if log_level <= LOG_ERROR:
         msg(f"ERROR {message} {ctx}")

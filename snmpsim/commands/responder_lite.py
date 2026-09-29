@@ -419,19 +419,20 @@ def main():
                 context_name=community_name,
             ):
                 if candidate in contexts:
-                    log.info(
-                        "Using %s selected by candidate %s; transport ID %s, "
-                        "source address %s, context engine ID <empty>, "
-                        "community name "
-                        '"%s"'
-                        % (
-                            contexts[candidate],
-                            candidate,
-                            univ.ObjectIdentifier(transport_domain),
-                            transport_address[0],
-                            community_name,
+                    if log.enabled(log.LOG_INFO):
+                        log.info(
+                            "Using %s selected by candidate %s; transport ID %s, "
+                            "source address %s, context engine ID <empty>, "
+                            "community name "
+                            '"%s"'
+                            % (
+                                contexts[candidate],
+                                candidate,
+                                univ.ObjectIdentifier(transport_domain),
+                                transport_address[0],
+                                community_name,
+                            )
                         )
-                    )
                     community_name = candidate
                     break
 

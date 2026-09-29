@@ -9,7 +9,6 @@
 import os
 import stat
 
-from pyasn1.type import univ
 from pysnmp.carrier.asyncio.dgram import udp
 from pysnmp.carrier.asyncio.dgram import udp6
 from pysnmp.proto import rfc1902
@@ -90,23 +89,22 @@ class DataFile(AbstractLayout):
         vars_remaining = vars_total = len(var_binds)
         err_total = 0
 
-        log.info(
-            "Request var-binds: %s, flags: %s, "
-            "%s"
-            % (
-                ", ".join([f"{vb[0]}=<{vb[1].prettyPrint()}>" for vb in var_binds]),
-                context.get("nextFlag") and "NEXT" or "EXACT",
-                context.get("setFlag") and "SET" or "GET",
+        if log.enabled(log.LOG_INFO):
+            log.info(
+                "Request var-binds: %s, flags: %s, "
+                "%s"
+                % (
+                    ", ".join([f"{vb[0]}=<{vb[1].prettyPrint()}>" for vb in var_binds]),
+                    context.get("nextFlag") and "NEXT" or "EXACT",
+                    context.get("setFlag") and "SET" or "GET",
+                )
             )
-        )
 
         for oid, val in var_binds:
-            text_oid = str(univ.OctetString(".".join(["%s" % x for x in oid])))
+            text_oid = ".".join(map(str, oid))
 
             try:
-                offset, subtree_flag, prev_offset = self._record_index.lookup(
-                    str(univ.OctetString(".".join(["%s" % x for x in oid])))
-                )
+                offset, subtree_flag, prev_offset = self._record_index.lookup(text_oid)
                 exact_match = True
 
             except KeyError:
@@ -220,10 +218,15 @@ class DataFile(AbstractLayout):
 
             rsp_var_binds.append((_oid, _val))
 
-        log.info(
-            "Response var-binds: %s"
-            % (", ".join([f"{vb[0]}=<{vb[1].prettyPrint()}>" for vb in rsp_var_binds]))
-        )
+        if log.enabled(log.LOG_INFO):
+            log.info(
+                "Response var-binds: %s"
+                % (
+                    ", ".join(
+                        [f"{vb[0]}=<{vb[1].prettyPrint()}>" for vb in rsp_var_binds]
+                    )
+                )
+            )
 
         ReportingManager.update_metrics(
             data_file=self._text_file,
