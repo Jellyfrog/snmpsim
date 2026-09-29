@@ -632,6 +632,18 @@ configured automatically based on simulation data file paths relative to
         _mib_instrums = {}
         _data_files = {}
 
+        data_files = {
+            data_dir: datafile.get_data_files(data_dir)
+            for data_dir in data_dirs
+            if os.path.exists(data_dir)
+        }
+
+        indexed = datafile.build_indices(
+            [data_file for files in data_files.values() for data_file in files],
+            args.force_index_rebuild,
+            args.validate_data,
+        )
+
         for dataDir in data_dirs:
             log.info(
                 'Scanning "%s" directory for %s data '
@@ -653,9 +665,7 @@ configured automatically based on simulation data file paths relative to
 
             log.msg.inc_ident()
 
-            for full_path, text_parser, community_name in datafile.get_data_files(
-                dataDir
-            ):
+            for full_path, text_parser, community_name in data_files[dataDir]:
                 if community_name in _data_files:
                     log.error(
                         'ignoring duplicate Community/ContextName "%s" for data '
@@ -672,7 +682,10 @@ configured automatically based on simulation data file paths relative to
                     data_file = datafile.DataFile(
                         full_path, text_parser, variation_modules
                     )
-                    data_file.index_text(args.force_index_rebuild, args.validate_data)
+                    data_file.index_text(
+                        args.force_index_rebuild and full_path not in indexed,
+                        args.validate_data,
+                    )
 
                     MibController = controller.MIB_CONTROLLERS[data_file.layout]
                     mib_instrum = MibController(data_file)

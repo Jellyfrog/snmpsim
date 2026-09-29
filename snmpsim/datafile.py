@@ -15,6 +15,7 @@ from pysnmp.proto import rfc1902
 from pysnmp.smi import exval
 from pysnmp.smi.error import MibOperationError
 
+from snmpsim import confdir
 from snmpsim import log
 from snmpsim import variation
 from snmpsim.error import NoDataNotification
@@ -244,6 +245,64 @@ class DataFile(AbstractLayout):
 
     def __str__(self):
         return "%s controller" % self._text_file
+
+
+def _available_cpus():
+    try:
+        return len(os.sched_getaffinity(0))
+
+    except AttributeError:  # not available on all platforms
+        return os.cpu_count() or 1
+
+
+def _build_index(text_file, record_type, cache_dir, validate_data):
+    """Worker process entry point, may not share any state with the parent"""
+    confdir.cache = cache_dir
+
+    RecordIndex(text_file, variation.RECORD_TYPES[record_type])._build(validate_data)
+
+
+def build_indices(data_files, force_index_build=False, validate_data=False):
+    """Build missing or outdated data file indices in parallel.
+
+    Takes (path, record type, community) items as returned by
+    get_data_files(). Returns the paths of the data files indexed here,
+    other data files are left for DataFile.index_text() to handle.
+    """
+    record_types = {id(v): k for k, v in variation.RECORD_TYPES.items()}
+
+    pending = {}
+
+    for text_file, text_parser, _ in data_files:
+        if text_file in pending or id(text_parser) not in record_types:
+            continue
+
+        if RecordIndex(text_file, text_parser).index_needed(force_index_build):
+            pending[text_file] = record_types[id(text_parser)]
+
+    workers = min(len(pending), _available_cpus())
+
+    if workers < 2:
+        return set()
+
+    log.info("Building %d indices using %d processes" % (len(pending), workers))
+
+    # not needed for a warm start, spare the import time
+    from concurrent.futures import ProcessPoolExecutor
+
+    with ProcessPoolExecutor(workers) as executor:
+        # results in submission order, so the first broken data file is reported
+        for _ in executor.map(
+            _build_index,
+            pending,
+            pending.values(),
+            [confdir.cache] * len(pending),
+            [validate_data] * len(pending),
+            chunksize=8,
+        ):
+            pass
+
+    return set(pending)
 
 
 def get_data_files(tgt_dir, top_len=None):

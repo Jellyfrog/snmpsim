@@ -291,3 +291,47 @@ def test_modified_data_file_is_reopened(data_file, monkeypatch):
     assert "1.3.6.1.2.1.3.0" in db
 
     index.close()
+
+
+def test_build_indices(tmp_path, monkeypatch):
+    # use the process pool even on single CPU machines
+    monkeypatch.setattr(datafile, "_available_cpus", lambda: 2)
+
+    paths = []
+
+    for name in ("a", "b", "c"):
+        path = tmp_path / f"{name}.snmprec"
+        path.write_bytes(RECORDS)
+        # indices must be newer than data files, at one second resolution
+        bump_mtime(path, -10)
+        paths.append(str(path))
+
+    data_files = [(path, PARSER, "x") for path in paths]
+
+    assert datafile.build_indices(data_files) == set(paths)
+    assert len(os.listdir(confdir.cache)) == 3
+
+    for path in paths:
+        assert not RecordIndex(path, PARSER).index_needed()
+
+    # all up to date, nothing to do
+    assert datafile.build_indices(data_files) == set()
+
+    assert datafile.build_indices(data_files, force_index_build=True) == set(paths)
+
+    index = RecordIndex(paths[0], PARSER)
+    index.open()
+    assert index.lookup("1.3.6.1.2.1.1.3.0")[0] == offset_of("1.3.6.1.2.1.1.3.0")
+    index.close()
+
+
+def test_build_indices_reports_broken_data(tmp_path, monkeypatch):
+    monkeypatch.setattr(datafile, "_available_cpus", lambda: 2)
+
+    good = tmp_path / "good.snmprec"
+    good.write_bytes(RECORDS)
+    broken = tmp_path / "broken.snmprec"
+    broken.write_bytes(b"1.3.6.1.2.1.1.1.0|4|ok\nnot a record\n")
+
+    with pytest.raises(error.SnmpsimError, match=r"broken\.snmprec:2"):
+        datafile.build_indices([(str(good), PARSER, "g"), (str(broken), PARSER, "b")])

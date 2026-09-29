@@ -77,30 +77,32 @@ class RecordIndex:
 
         return self._text, self._db
 
-    def create(self, force_index_build=False, validate_data=False):
-        text_file_time = os.stat(self._text_file)[8]
-
-        index_needed = force_index_build
-
+    def index_needed(self, force_index_build=False):
+        """Whether the index has to be (re)built"""
         try:
             db_file_time = os.stat(self._db_file)[8]
 
         except OSError:
-            index_needed = True
             log.info(
                 "Index %s does not exist for data file "
                 "%s" % (self._db_file, self._text_file)
             )
+            return True
 
-        else:
-            if text_file_time >= db_file_time:
-                index_needed = True
-                log.info("Index %s out of date" % self._db_file)
+        if os.stat(self._text_file)[8] >= db_file_time:
+            log.info("Index %s out of date" % self._db_file)
+            return True
 
-            elif index_needed:
-                log.info("Forced index rebuild %s" % self._db_file)
+        if force_index_build:
+            log.info("Forced index rebuild %s" % self._db_file)
+            return True
 
-        if index_needed:
+        return False
+
+    def create(self, force_index_build=False, validate_data=False):
+        text_file_time = os.stat(self._text_file)[8]
+
+        if self.index_needed(force_index_build):
             self._build(validate_data)
 
         self._text_file_time = text_file_time
