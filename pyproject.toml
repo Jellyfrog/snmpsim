@@ -30,7 +30,7 @@ classifiers = [
     "Topic :: System :: Networking :: Monitoring",
 ]
 dependencies = [
-    "pysnmp>=7.1.26,<8.0.0"
+    "pysnmp>=7.1.26"
 ]
 
 [project.urls]
@@ -61,21 +61,21 @@ include = [
 
 [project.optional-dependencies]
 dev = [
-    "codecov>=2.1.12,<3.0.0",
-    "cryptography>=43.0.0,<44.0.0",
-    "pysmi>=2.0.0,<3.0.0",
-    "pytest>=7.2.0,<8.0.0",
-    "pytest-asyncio>=0.21.1,<0.22.0",
-    "pytest-codecov>=0.4.0,<1.0.0",
-    "pytest-rerunfailures>=12.0,<13.0",
-    "tomli>=2.0.1,<3.0.0; python_version<'3.11'",
-    "Sphinx>=7.0.0,<8.0.0",
-    "sphinx-copybutton>=0.5.2,<0.6.0",
-    "sphinx-sitemap-lextudio>=2.5.2,<3.0.0",
-    "furo>=2024.1.1,<2025.0.0",
-    "black==23.1.0",
-    "pre-commit==2.21.0",
-    "doc8>=1.1.1,<2.0.0",
-    "sphinx-notfound-page>=1.0.0,<2.0.0",
-    "bump2version>=1.0.1",
+    "codecov",
+    "cryptography",
+    "pysmi",
+    "pytest",
+    "pytest-asyncio",
+    "pytest-codecov",
+    "pytest-rerunfailures",
+    "tomli; python_version<'3.11'",
+    "Sphinx",
+    "sphinx-copybutton",
+    "sphinx-sitemap-lextudio",
+    "furo",
+    "black",
+    "pre-commit",
+    "doc8",
+    "sphinx-notfound-page",
+    "bump2version",
 ]
