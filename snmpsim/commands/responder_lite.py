@@ -8,6 +8,7 @@
 #
 import argparse
 import asyncio
+import functools
 import os
 import sys
 import traceback
@@ -394,6 +395,18 @@ def main():
 
         return rsp_var_binds
 
+    @functools.lru_cache(maxsize=4096)
+    def select_context(transport_domain, source_address, community_name):
+        """Pick data file context, these do not change after start-up"""
+        for candidate in datafile.probe_context(
+            transport_domain,
+            (source_address,),
+            context_engine_id=datafile.SELF_LABEL,
+            context_name=univ.OctetString(community_name),
+        ):
+            if candidate in contexts:
+                return candidate
+
     def commandResponderCbFun(
         transport_dispatcher, transport_domain, transport_address, whole_msg
     ):
@@ -412,29 +425,28 @@ def main():
 
             community_name = req_msg.getComponentByPosition(1)
 
-            for candidate in datafile.probe_context(
-                transport_domain,
-                transport_address,
-                context_engine_id=datafile.SELF_LABEL,
-                context_name=community_name,
-            ):
-                if candidate in contexts:
-                    if log.enabled(log.LOG_INFO):
-                        log.info(
-                            "Using %s selected by candidate %s; transport ID %s, "
-                            "source address %s, context engine ID <empty>, "
-                            "community name "
-                            '"%s"'
-                            % (
-                                contexts[candidate],
-                                candidate,
-                                univ.ObjectIdentifier(transport_domain),
-                                transport_address[0],
-                                community_name,
-                            )
+            candidate = select_context(
+                tuple(transport_domain),
+                transport_address[0],
+                community_name.asOctets(),
+            )
+
+            if candidate is not None:
+                if log.enabled(log.LOG_INFO):
+                    log.info(
+                        "Using %s selected by candidate %s; transport ID %s, "
+                        "source address %s, context engine ID <empty>, "
+                        "community name "
+                        '"%s"'
+                        % (
+                            contexts[candidate],
+                            candidate,
+                            univ.ObjectIdentifier(transport_domain),
+                            transport_address[0],
+                            community_name,
                         )
-                    community_name = candidate
-                    break
+                    )
+                community_name = candidate
 
             else:
                 log.error(
