@@ -5,31 +5,25 @@
 # License: https://www.pysnmp.com/snmpsim/license.html
 #
 
-import dbm
+import marshal
 import os
-import sys
 
 from snmpsim import confdir
 from snmpsim import error
 from snmpsim import log
-from snmpsim.record.search.file import get_record
 
-# Python 3.13+ defaults to dbm.sqlite3 which fsyncs every write,
-# causing ~100x slower index builds. Override the default backend
-# to prefer gdbm or ndbm which don't have this issue.
-for _preferred in ('dbm.gnu', 'dbm.ndbm', 'dbm.dumb'):
-    try:
-        _mod = __import__(_preferred, fromlist=['open'])
-    except ImportError:
-        continue
-    dbm._defaultmod = _mod
-    dbm._modules[_preferred] = _mod
-    break
-
-whichdb = dbm
+# Bump whenever the on-disk index layout changes
+INDEX_VERSION = 1
 
 
 class RecordIndex:
+    """OID -> (offset, subtree_flag, prev_offset) index of a data file.
+
+    The index is a plain dict persisted with `marshal` in the cache
+    directory. It is loaded into memory as a whole when the data file
+    is opened.
+    """
+
     def __init__(self, text_file, text_parser):
         self._text_file = text_file
         self._text_parser = text_parser
@@ -40,7 +34,7 @@ class RecordIndex:
         except ValueError:
             self._db_file = text_file
 
-        self._db_file += os.path.extsep + "dbm"
+        self._db_file += os.path.extsep + "idx"
 
         self._db_file = os.path.join(
             confdir.cache,
@@ -48,15 +42,13 @@ class RecordIndex:
         )
 
         self._db = self._text = None
-        self._db_type = "?"
 
         self._text_file_time = 0
 
     def __str__(self):
-        return "Data file {}, {}-indexed, {}".format(
+        return "Data file {}, {}".format(
             self._text_file,
-            self._db_type,
-            self._db and "opened" or "closed",
+            self._db is not None and "opened" or "closed",
         )
 
     def is_open(self):
@@ -74,115 +66,71 @@ class RecordIndex:
 
         return self._text, self._db
 
-    @property
-    def _db_files(self):
-        return (
-            self._db_file + os.path.extsep + "db",
-            self._db_file + os.path.extsep + "dat",
-            self._db_file,
-        )
-
     def create(self, force_index_build=False, validate_data=False):
         text_file_time = os.stat(self._text_file)[8]
 
-        # gdbm on OS X seems to voluntarily append .db, trying to catch that
-
         index_needed = force_index_build
 
-        for db_file in self._db_files:
-            if os.path.exists(db_file):
-                if text_file_time < os.stat(db_file)[8]:
-                    if index_needed:
-                        log.info("Forced index rebuild %s" % db_file)
+        try:
+            db_file_time = os.stat(self._db_file)[8]
 
-                    elif not whichdb.whichdb(self._db_file):
-                        index_needed = True
-                        log.info(
-                            "Unsupported index format, rebuilding " "index %s" % db_file
-                        )
-
-                else:
-                    index_needed = True
-                    log.info("Index %s out of date" % db_file)
-
-                break
-
-        else:
+        except OSError:
             index_needed = True
             log.info(
                 "Index %s does not exist for data file "
                 "%s" % (self._db_file, self._text_file)
             )
 
+        else:
+            if text_file_time >= db_file_time:
+                index_needed = True
+                log.info("Index %s out of date" % self._db_file)
+
+            elif index_needed:
+                log.info("Forced index rebuild %s" % self._db_file)
+
         if index_needed:
-            # these might speed-up indexing
-            open_flags = "nfu"
+            self._build(validate_data)
 
-            errors = []
+        self._text_file_time = text_file_time
 
-            while open_flags:
-                try:
-                    db = dbm.open(self._db_file, open_flags)
+        return self
 
-                except Exception as exc:
-                    log.debug(
-                        'DBM open with flags "%s" failed on file '
-                        "%s: %s" % (open_flags, self._db_file, exc)
-                    )
-                    errors.append(str(exc))
-                    open_flags = open_flags[:-1]
-                    continue
+    def _build(self, validate_data):
+        try:
+            text = self._text_parser.open(self._text_file)
 
-                else:
-                    break
-            else:
-                raise error.SnmpsimError(
-                    "Failed to create %s for data file "
-                    "%s: %s" % (self._db_file, self._text_file, "; ".join(errors))
-                )
-
-            try:
-                text = self._text_parser.open(self._text_file)
-
-            except Exception as exc:
-                raise error.SnmpsimError(
-                    f"Failed to open data file {self._db_file}: {exc}"
-                )
-
-            log.info(
-                "Building index %s for data file %s (open flags "
-                '"%s")...' % (self._db_file, self._text_file, open_flags)
+        except Exception as exc:
+            raise error.SnmpsimError(
+                f"Failed to open data file {self._text_file}: {exc}"
             )
 
-            sys.stdout.flush()
+        log.info(
+            "Building index %s for data file %s..." % (self._db_file, self._text_file)
+        )
 
-            line_no = 0
-            offset = 0
-            prev_offset = -1
+        parse = self._text_parser.grammar.parse
 
-            while True:
-                line, line_no, offset = get_record(text, line_no, offset)
+        db = {}
+        line_no = 0
+        offset = 0
+        prev_offset = -1
 
-                if not line:
-                    # reference to last OID in data file
-                    db["last"] = "%d,%d,%d" % (offset, 0, prev_offset)
-                    break
+        with text:
+            for line_no, line in enumerate(text, 1):
+                tline = line.strip()
+
+                # skip comment or blank line
+                if not tline or tline.startswith(b"#"):
+                    offset += len(line)
+                    continue
 
                 try:
-                    oid, tag, val = self._text_parser.grammar.parse(line)
+                    oid, tag, val = parse(line)
 
                 except Exception as exc:
-                    db.close()
-
-                    for db_file in self._db_files:
-                        try:
-                            os.remove(db_file)
-
-                        except OSError:
-                            pass
-
                     raise error.SnmpsimError(
-                        "Data error at %s:%d:" " %s" % (self._text_file, line_no, exc)
+                        "Data error at %s:%d: %s" % (self._text_file, line_no, exc)
                     )
 
                 if validate_data:
@@ -190,15 +138,6 @@ class RecordIndex:
                         self._text_parser.evaluate_oid(oid)
 
                     except Exception as exc:
-                        db.close()
-
-                        for db_file in self._db_files:
-                            try:
-                                os.remove(db_file)
-
-                            except OSError:
-                                pass
-
                         raise error.SnmpsimError(
                             "OID error at %s:%d: %s" % (self._text_file, line_no, exc)
                         )
@@ -209,40 +148,71 @@ class RecordIndex:
                         )
 
                     except Exception as exc:
-                        log.info(
-                            "ERROR at line %s, value %r: " "%s" % (line_no, val, exc)
-                        )
+                        log.info("ERROR at line %s, value %r: %s" % (line_no, val, exc))
 
                 # for lines serving subtrees, type is empty in tag field
-                db[oid] = "%d,%d,%d" % (offset, tag[0] == ":", prev_offset)
+                subtree_flag = tag[0] == ":"
 
-                if tag[0] == ":":
-                    prev_offset = offset
+                db[oid] = (offset, subtree_flag, prev_offset)
 
-                else:
-                    prev_offset = -1  # not a subtree - no back reference
+                # not a subtree - no back reference
+                prev_offset = offset if subtree_flag else -1
 
                 offset += len(line)
 
-            text.close()
-            db.close()
+        # reference to last OID in data file
+        db["last"] = (offset, False, prev_offset)
 
-            log.info("...%d entries indexed" % line_no)
+        # write atomically so concurrent readers never see a partial index
+        tmp_file = "%s.%d.tmp" % (self._db_file, os.getpid())
 
-        self._text_file_time = os.stat(self._text_file)[8]
+        try:
+            with open(tmp_file, "wb") as f:
+                marshal.dump((INDEX_VERSION, db), f)
 
-        self._db_type = whichdb.whichdb(self._db_file)
+            os.replace(tmp_file, self._db_file)
 
-        return self
+        except OSError as exc:
+            try:
+                os.remove(tmp_file)
+
+            except OSError:
+                pass
+
+            raise error.SnmpsimError(f"Failed to write index {self._db_file}: {exc}")
+
+        log.info("...%d entries indexed" % line_no)
 
     def lookup(self, oid):
         return self._db[oid]
 
+    def _load(self):
+        try:
+            with open(self._db_file, "rb") as f:
+                version, db = marshal.load(f)
+
+        except (OSError, EOFError, ValueError, TypeError):
+            return None
+
+        if version != INDEX_VERSION:
+            return None
+
+        return db
+
     def open(self):
+        db = self._load()
+
+        if db is None:
+            log.info("Index %s unreadable, rebuilding" % self._db_file)
+            self._build(validate_data=False)
+            db = self._load()
+
+            if db is None:
+                raise error.SnmpsimError(f"Failed to load index {self._db_file}")
+
         self._text = self._text_parser.open(self._text_file)
-        self._db = dbm.open(self._db_file)
+        self._db = db
 
     def close(self):
         self._text.close()
-        self._db.close()
         self._db = self._text = None

@@ -100,25 +100,18 @@ class DataFile(AbstractLayout):
             )
         )
 
-        separator = b","
-
         for oid, val in var_binds:
             text_oid = str(univ.OctetString(".".join(["%s" % x for x in oid])))
 
             try:
-                line = self._record_index.lookup(
+                offset, subtree_flag, prev_offset = self._record_index.lookup(
                     str(univ.OctetString(".".join(["%s" % x for x in oid])))
                 )
+                exact_match = True
 
             except KeyError:
                 offset = search_record_by_oid(oid, text, self._text_parser)
                 subtree_flag = exact_match = False
-
-            else:
-                offset, subtree_flag, prev_offset = line.split(separator, 2)
-                subtree_flag, exact_match = int(subtree_flag), True
-
-            offset = int(offset)
 
             text.seek(offset)
 
@@ -139,7 +132,7 @@ class DataFile(AbstractLayout):
                             try:
                                 _, subtree_flag, _ = self._record_index.lookup(
                                     str(_next_oid)
-                                ).split(separator, 2)
+                                )
 
                             except KeyError:
                                 log.error(
@@ -149,7 +142,6 @@ class DataFile(AbstractLayout):
                                 line = ""  # fatal error
 
                             else:
-                                subtree_flag = int(subtree_flag)
                                 line = _next_line
 
                         else:
@@ -163,9 +155,7 @@ class DataFile(AbstractLayout):
                         _oid = "last"
 
                     try:
-                        _, _, _prev_offset = self._record_index.lookup(str(_oid)).split(
-                            separator, 2
-                        )
+                        _, _, _prev_offset = self._record_index.lookup(str(_oid))
 
                     except KeyError:
                         log.error(
@@ -174,8 +164,6 @@ class DataFile(AbstractLayout):
                         line = ""  # fatal error
 
                     else:
-                        _prev_offset = int(_prev_offset)
-
                         # previous line serves a subtree?
                         if _prev_offset >= 0:
                             text.seek(_prev_offset)

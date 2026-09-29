@@ -243,15 +243,14 @@ def variate(oid, tag, value, **context):
     textOid = str(rfc1902.OctetString(".".join(["%s" % x for x in context["origOid"]])))
 
     try:
-        line = moduleContext[oid]["datafileobj"].lookup(textOid)
+        offset, subtreeFlag, prevOffset = moduleContext[oid]["datafileobj"].lookup(
+            textOid
+        )
+        exactMatch = True
 
     except KeyError:
         offset = search_record_by_oid(context["origOid"], text, parser)
         exactMatch = False
-
-    else:
-        offset, subtreeFlag, prevOffset = line.split(b",")
-        exactMatch = True
 
     text.seek(int(offset))
 
