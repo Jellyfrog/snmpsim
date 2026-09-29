@@ -7,6 +7,7 @@
 # SNMP Snapshot Data Recorder
 #
 import argparse
+import asyncio
 import functools
 import os
 import sys
@@ -79,6 +80,12 @@ def _parse_sized_string(arg, min_length=8):
 
 
 def main():
+    # Python 3.14+ no longer auto-creates a default event loop.
+    try:
+        asyncio.get_event_loop()
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+
     variation_module = None
 
     parser = argparse.ArgumentParser(description=DESCRIPTION)
