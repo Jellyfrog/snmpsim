@@ -126,12 +126,12 @@ class DataIndexInstrumController:
     def __str__(self):
         return "<index> controller"
 
-    def read_variables(self, var_binds, **context):
+    def read_variables(self, *var_binds, **context):
         return [(vb[0], self._db.get(vb[0], exval.noSuchInstance)) for vb in var_binds]
 
     def _get_next_val(self, key, default):
         try:
-            key = self._db.nextKey(key)
+            key = self._db.next_key(key)
 
         except KeyError:
             return key, default
@@ -139,10 +139,10 @@ class DataIndexInstrumController:
         else:
             return key, self._db[key]
 
-    def read_next_variables(self, var_binds, **context):
+    def read_next_variables(self, *var_binds, **context):
         return [self._get_next_val(vb[0], exval.endOfMib) for vb in var_binds]
 
-    def write_variables(self, var_binds, **context):
+    def write_variables(self, *var_binds, **context):
         return [(vb[0], exval.noSuchInstance) for vb in var_binds]
 
     def add_data_file(self, *args):
