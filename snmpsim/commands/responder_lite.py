@@ -392,7 +392,9 @@ def main():
         del _mib_instrums
         del _data_files
 
-    def get_bulk_handler(req_var_binds, non_repeaters, max_repetitions, read_next_vars):
+    def get_bulk_handler(
+        req_var_binds, non_repeaters, max_repetitions, read_next_vars, read_next_run=None
+    ):
         """Only v2c arch GETBULK handler"""
         N = min(int(non_repeaters), len(req_var_binds))
         M = int(max_repetitions)
@@ -408,6 +410,11 @@ def main():
             rsp_var_binds = []
 
         var_binds = req_var_binds[-R:]
+
+        if R == 1 and M > 0 and read_next_run:
+            # a single column is a chain of GETNEXTs, done in one go
+            rsp_var_binds.extend(read_next_run(var_binds[0], M))
+            return rsp_var_binds
 
         while M and R:
             rsp_var_binds.extend(read_next_vars(*var_binds))
@@ -500,6 +507,7 @@ def main():
                     non_repeaters,
                     max_repetitions,
                     mib_instrum.read_next_variables,
+                    getattr(mib_instrum, "read_next_run", None),
                 )
 
         try:

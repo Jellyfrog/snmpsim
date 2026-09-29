@@ -107,6 +107,15 @@ class MibInstrumController:
             var_binds, **self._get_call_context(True, False, **context)
         )
 
+    def read_next_run(self, var_bind, count, **context):
+        """Results of `count` chained GETNEXT requests, see DataFile"""
+        return self._data_file.read_next_run(
+            var_bind[0],
+            var_bind[1],
+            count,
+            **self._get_call_context(True, False, **context),
+        )
+
     def write_variables(self, *var_binds, **context):
         return self._data_file.process_var_binds(
             var_binds, **self._get_call_context(False, True, **context)

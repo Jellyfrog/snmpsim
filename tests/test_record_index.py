@@ -335,3 +335,35 @@ def test_build_indices_reports_broken_data(tmp_path, monkeypatch):
 
     with pytest.raises(error.SnmpsimError, match=r"broken\.snmprec:2"):
         datafile.build_indices([(str(good), PARSER, "g"), (str(broken), PARSER, "b")])
+
+
+@pytest.mark.parametrize("log_level", ["error", "info"])
+@pytest.mark.parametrize(
+    "start",
+    ["1.3", "1.3.6.1.2.1.1.1.0", "1.3.6.1.2.1.1.2", "1.3.6.1.2.1.2", "1.3.6.1.2.1.3"],
+)
+def test_read_next_run_matches_chained_getnext(data_file, start, log_level):
+    log.set_level(log_level)
+
+    try:
+        data = datafile.DataFile(data_file, PARSER, {}).index_text()
+        ctx = {"nextFlag": True, "setFlag": False}
+
+        def render(var_binds):
+            return [(str(oid), val.prettyPrint()) for oid, val in var_binds]
+
+        expected = []
+        var_bind = (univ.ObjectIdentifier(start), univ.Null(""))
+
+        for _ in range(8):
+            (var_bind,) = data.process_var_binds([var_bind], **ctx)
+            expected.append(var_bind)
+
+        run = data.read_next_run(univ.ObjectIdentifier(start), univ.Null(""), 8, **ctx)
+
+        assert render(run) == render(expected)
+
+        data.close()
+
+    finally:
+        log.set_level("info")

@@ -203,6 +203,9 @@ class RecordIndex:
     def lookup(self, oid):
         return self._db[oid]
 
+    def get(self, oid):
+        return self._db.get(oid)
+
     def _build_search_table(self):
         # duplicate OIDs share one index entry, the file search may differ
         if not self._unique_oids:

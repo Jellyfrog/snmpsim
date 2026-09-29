@@ -243,6 +243,101 @@ class DataFile(AbstractLayout):
 
         return rsp_var_binds
 
+    def _read_next_plain(self, text, oid, val, context):
+        """GETNEXT for `oid` by reading the following record directly.
+
+        Only handles `oid` matching a plain record followed by another
+        plain record, returns None otherwise.
+        """
+        entry = self._record_index.get(".".join(map(str, oid)))
+
+        if entry is None or entry[1]:  # not found or serving a subtree
+            return
+
+        text.seek(entry[0])
+        get_record(text)  # matched record
+
+        line, _, _ = get_record(text)
+
+        if not line:
+            return
+
+        key, tag, _ = self._text_parser.grammar.parse(line)
+
+        if ":" in tag:  # variation module or subtree
+            return
+
+        entry = self._record_index.get(key)
+
+        if entry is None or entry[1]:
+            return
+
+        call_context = context.copy()
+        call_context.update(
+            (),
+            origOid=oid,
+            origValue=val,
+            dataFile=self._text_file,
+            subtreeFlag=False,
+            exactMatch=True,
+            errorStatus=exval.endOfMib,
+            varsTotal=1,
+            varsRemaining=0,
+            variationModules=self._variation_modules,
+        )
+
+        try:
+            return self._text_parser.evaluate(line, **call_context)
+
+        except Exception:
+            return  # let process_var_binds() handle and report it
+
+    def read_next_run(self, oid, val, count, **context):
+        """Results of `count` chained GETNEXT requests starting at `oid`.
+
+        Same as calling process_var_binds() with each previous result,
+        but consecutive plain records are read directly from the data file.
+        """
+        if log.enabled(log.LOG_INFO):
+            # keep logging every step
+            run = []
+
+            for _ in range(count):
+                run.extend(self.process_var_binds([(oid, val)], **context))
+                oid, val = run[-1]
+
+            return run
+
+        try:
+            text, _ = self.get_handles()
+
+        except SnmpsimError:
+            text = None
+
+        run = []
+
+        for _ in range(count):
+            var_bind = text and self._read_next_plain(text, oid, val, context)
+
+            if var_bind:
+                ReportingManager.update_metrics(
+                    data_file=self._text_file,
+                    varbind_count=1,
+                    datafile_call_count=1,
+                    datafile_failure_count=0,
+                    transport_call_count=1,
+                    **context,
+                )
+
+                run.append(var_bind)
+
+            else:
+                run.extend(self.process_var_binds([(oid, val)], **context))
+
+            oid, val = run[-1]
+
+        return run
+
     def __str__(self):
         return "%s controller" % self._text_file
 
