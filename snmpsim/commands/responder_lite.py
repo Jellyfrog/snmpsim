@@ -10,8 +10,10 @@ import argparse
 import asyncio
 import functools
 import os
+import signal
 import socket
 import sys
+import time
 import traceback
 
 from pyasn1 import debug as pyasn1_debug
@@ -210,6 +212,16 @@ def main():
     )
 
     parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        metavar="<N>",
+        help="Number of processes answering requests in parallel. Each keeps "
+        "its own variation module state, so e.g. values SET through the "
+        "writecache module are only seen by the process that handled the SET",
+    )
+
+    parser.add_argument(
         "--data-dir",
         type=str,
         action="append",
@@ -241,6 +253,12 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+
+    if args.workers > 1 and not hasattr(os, "fork"):
+        parser.error("--workers above 1 is not supported on this platform")
 
     if args.debug:
         pysnmp_debug.setLogger(pysnmp_debug.Debug(*args.debug))
@@ -306,9 +324,6 @@ def main():
     variation_modules = variation.load_variation_modules(
         confdir.variation, variation_modules_options
     )
-
-    with daemon.PrivilegesOf(args.process_user, args.process_group):
-        variation.initialize_variation_modules(variation_modules, mode="variating")
 
     def configure_managed_objects(
         data_dirs, data_index_instrum_controller, snmp_engine=None, snmp_context=None
@@ -393,7 +408,11 @@ def main():
         del _data_files
 
     def get_bulk_handler(
-        req_var_binds, non_repeaters, max_repetitions, read_next_vars, read_next_run=None
+        req_var_binds,
+        non_repeaters,
+        max_repetitions,
+        read_next_vars,
+        read_next_run=None,
     ):
         """Only v2c arch GETBULK handler"""
         N = min(int(non_repeaters), len(req_var_binds))
@@ -723,8 +742,6 @@ def main():
     contexts["index"] = data_index_instrum_controller
 
     # Configure socket server
-    loop = asyncio.get_event_loop()
-
     server_sockets = []
 
     def open_server_socket(endpoint, transport_domain, ipv6=False):
@@ -743,9 +760,7 @@ def main():
 
         sock.setblocking(False)
 
-        loop.add_reader(sock, receive, sock, transport_domain)
-
-        server_sockets.append(sock)
+        server_sockets.append((sock, transport_domain))
 
         log.msg(
             "Listening at UDP/IPv%s endpoint %s, transport ID "
@@ -773,7 +788,13 @@ def main():
 
         open_server_socket(agent_udpv6_endpoint, transport_domain, ipv6=True)
 
-    with daemon.PrivilegesOf(args.process_user, args.process_group, final=True):
+    def serve(loop):
+        """Answer requests until interrupted or the loop is stopped"""
+        variation.initialize_variation_modules(variation_modules, mode="variating")
+
+        for sock, transport_domain in server_sockets:
+            loop.add_reader(sock, receive, sock, transport_domain)
+
         try:
             loop.run_forever()
 
@@ -797,8 +818,116 @@ def main():
                     else:
                         log.info('Variation module "%s" shutdown OK' % name)
 
-            for sock in server_sockets:
+            for sock, _ in server_sockets:
                 loop.remove_reader(sock)
+
+    def start_worker():
+        """Fork a process serving requests from the shared sockets"""
+        pid = os.fork()
+
+        if pid:
+            return pid
+
+        exit_code = 0
+
+        try:
+            signal.signal(signal.SIGTERM, signal.default_int_handler)
+
+            # the parent's event loop must not be shared
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            parent = os.getppid()
+
+            def watch_parent():
+                if os.getppid() != parent:
+                    log.error("Parent process gone, shutting down worker")
+                    loop.stop()
+
+                else:
+                    loop.call_later(1, watch_parent)
+
+            loop.call_later(1, watch_parent)
+
+            serve(loop)
+
+        except BaseException as exc:
+            log.error("Worker process failed: %s" % exc)
+            exit_code = 1
+
+        finally:
+            # skip atexit handlers of the parent, e.g. PID file removal
+            os._exit(exit_code)
+
+    def stop_workers(workers, timeout=5):
+        for pid in workers:
+            try:
+                os.kill(pid, signal.SIGTERM)
+
+            except ProcessLookupError:
+                pass
+
+        deadline = time.monotonic() + timeout
+
+        while workers:
+            for pid in list(workers):
+                try:
+                    done, _ = os.waitpid(pid, os.WNOHANG)
+
+                except ChildProcessError:
+                    done = pid
+
+                if done:
+                    workers.remove(pid)
+
+            if workers and time.monotonic() > deadline:
+                for pid in workers:
+                    log.error("Killing unresponsive worker process %s" % pid)
+                    os.kill(pid, signal.SIGKILL)
+                    os.waitpid(pid, 0)
+
+                break
+
+            time.sleep(0.05)
+
+    with daemon.PrivilegesOf(args.process_user, args.process_group, final=True):
+        loop = asyncio.get_event_loop()
+
+        workers = []
+
+        if args.workers > 1:
+            signal.signal(signal.SIGTERM, signal.default_int_handler)
+
+            workers = [start_worker() for _ in range(args.workers - 1)]
+
+            log.info("Started %d worker processes" % len(workers))
+
+            def reap_workers():
+                for pid in list(workers):
+                    try:
+                        done, status = os.waitpid(pid, os.WNOHANG)
+
+                    except ChildProcessError:
+                        done, status = pid, 0
+
+                    if done:
+                        workers.remove(pid)
+                        log.error(
+                            "Worker process %s exited with code %s"
+                            % (pid, os.waitstatus_to_exitcode(status))
+                        )
+
+                loop.call_later(1, reap_workers)
+
+            loop.call_later(1, reap_workers)
+
+        try:
+            serve(loop)
+
+        finally:
+            stop_workers(workers)
+
+            for sock, _ in server_sockets:
                 sock.close()
 
             log.info("Process terminated")

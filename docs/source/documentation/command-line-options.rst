@@ -350,6 +350,31 @@ engines created afterwards (by *--v3-engine-id* option) up to the next
 
    Binding ports less than 1024 on UNIX requires superuser privileges.
 
+Lightweight command responder options
+-------------------------------------
+
+The following options are only understood by
+*snmpsim-command-responder-lite*.
+
+**--workers**
++++++++++++++
+
+Number of processes answering SNMP requests in parallel. After the
+simulation data is indexed and the transport endpoints are bound, the
+responder forks this many processes sharing the endpoints, so concurrent
+requests from multiple SNMP managers are served at the same time.
+
+Each process keeps its own variation module state. For example, a value
+changed with *SET* through the *writecache* variation module is only seen
+by the process that happened to handle the *SET* request.
+
+.. code-block:: bash
+
+   $ snmpsim-command-responder-lite --workers=4 \
+       --agent-udpv4-endpoint=127.0.0.1:1161
+
+Not available on Windows. The default is *1*.
+
 Full version command responder options
 --------------------------------------
 
