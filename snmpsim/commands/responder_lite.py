@@ -30,12 +30,17 @@ from snmpsim import controller
 from snmpsim import daemon
 from snmpsim import datafile
 from snmpsim import endpoints
+from snmpsim import fastber
 from snmpsim import log
 from snmpsim import utils
 from snmpsim import variation
 from snmpsim.error import NoDataNotification
 from snmpsim.error import SnmpsimError
 from snmpsim.reporting.manager import ReportingManager
+
+SET_REQUEST = 0xA3
+
+NULL = univ.Null("")
 
 SNMP_2TO1_ERROR_MAP = {
     rfc1902.Counter64.tagSet: 5,
@@ -407,10 +412,179 @@ def main():
             if candidate in contexts:
                 return candidate
 
+    def process_request(
+        msg_ver,
+        community_name,
+        pdu_type,
+        req_var_binds,
+        non_repeaters,
+        max_repetitions,
+        transport_domain,
+        transport_address,
+    ):
+        """Run request against the selected data file.
+
+        Returns (error_status, error_index, var_binds) of the response or
+        None when no response should be sent.
+        """
+        candidate = select_context(
+            tuple(transport_domain), transport_address[0], community_name
+        )
+
+        if candidate is None:
+            log.error(
+                "No data file selected for transport ID %s, source "
+                "address %s, community name "
+                '"%s"'
+                % (
+                    univ.ObjectIdentifier(transport_domain),
+                    transport_address[0],
+                    community_name.decode("iso-8859-1"),
+                )
+            )
+            return
+
+        if log.enabled(log.LOG_INFO):
+            log.info(
+                "Using %s selected by candidate %s; transport ID %s, "
+                "source address %s, context engine ID <empty>, "
+                "community name "
+                '"%s"'
+                % (
+                    contexts[candidate],
+                    candidate,
+                    univ.ObjectIdentifier(transport_domain),
+                    transport_address[0],
+                    community_name.decode("iso-8859-1"),
+                )
+            )
+
+        mib_instrum = contexts[candidate]
+
+        if pdu_type == fastber.GET_REQUEST:
+            backend_fun = mib_instrum.read_variables
+
+        elif pdu_type == SET_REQUEST:
+            backend_fun = mib_instrum.write_variables
+
+        elif pdu_type == fastber.GET_NEXT_REQUEST:
+            backend_fun = mib_instrum.read_next_variables
+
+        else:  # GETBULK
+            if not msg_ver:
+                log.info(
+                    "GETBULK over SNMPv1 from %s:%s"
+                    % (transport_domain, transport_address)
+                )
+                return
+
+            def backend_fun(*var_binds):
+                return get_bulk_handler(
+                    var_binds,
+                    non_repeaters,
+                    max_repetitions,
+                    mib_instrum.read_next_variables,
+                )
+
+        try:
+            var_binds = backend_fun(*req_var_binds)
+
+        except NoDataNotification:
+            return
+
+        except Exception as exc:
+            log.error("Ignoring SNMP engine failure: %s" % exc)
+            return
+
+        if not msg_ver:
+            for idx, (oid, val) in enumerate(var_binds):
+                if val.tagSet in SNMP_2TO1_ERROR_MAP:
+                    return SNMP_2TO1_ERROR_MAP[val.tagSet], idx + 1, req_var_binds
+
+        return 0, 0, var_binds
+
+    def fast_command_responder(transport_domain, transport_address, whole_msg):
+        """Handle common requests without pyasn1 message (de)serialization.
+
+        Returns the encoded response, None if no response should be sent
+        or raises fastber.Unsupported if the message is not handled.
+        """
+        (
+            msg_ver,
+            community_name,
+            pdu_type,
+            request_id,
+            non_repeaters,
+            max_repetitions,
+            oids,
+        ) = fastber.decode_request(whole_msg)
+
+        req_var_binds = [(univ.ObjectIdentifier(oid), NULL) for oid in oids]
+
+        response = process_request(
+            msg_ver,
+            community_name,
+            pdu_type,
+            req_var_binds,
+            non_repeaters,
+            max_repetitions,
+            transport_domain,
+            transport_address,
+        )
+
+        if response is None:
+            return
+
+        error_status, error_index, var_binds = response
+
+        try:
+            return fastber.encode_response(
+                msg_ver,
+                community_name,
+                request_id,
+                error_status,
+                error_index,
+                var_binds,
+            )
+
+        except Exception:
+            # unusual response contents, let pysnmp encode it
+            p_mod = api.PROTOCOL_MODULES[msg_ver]
+
+            rsp_msg = p_mod.Message()
+            p_mod.apiMessage.set_defaults(rsp_msg)
+            p_mod.apiMessage.set_version(rsp_msg, msg_ver)
+            p_mod.apiMessage.set_community(rsp_msg, community_name)
+
+            rsp_pdu = p_mod.GetResponsePDU()
+            p_mod.apiPDU.set_defaults(rsp_pdu)
+            p_mod.apiPDU.set_request_id(rsp_pdu, request_id)
+            p_mod.apiPDU.set_error_status(rsp_pdu, error_status)
+            p_mod.apiPDU.set_error_index(rsp_pdu, error_index)
+            p_mod.apiPDU.set_varbinds(rsp_pdu, var_binds)
+
+            p_mod.apiMessage.set_pdu(rsp_msg, rsp_pdu)
+
+            return encoder.encode(rsp_msg)
+
     def commandResponderCbFun(
         transport_dispatcher, transport_domain, transport_address, whole_msg
     ):
         """v2c arch command responder request handling callback"""
+        try:
+            rsp = fast_command_responder(transport_domain, transport_address, whole_msg)
+
+        except fastber.Unsupported:
+            pass
+
+        else:
+            if rsp is not None:
+                transport_dispatcher.send_message(
+                    rsp, transport_domain, transport_address
+                )
+
+            return
+
         while whole_msg:
             msg_ver = api.decodeMessageVersion(whole_msg)
 
@@ -423,74 +597,21 @@ def main():
 
             req_msg, whole_msg = decoder.decode(whole_msg, asn1Spec=p_mod.Message())
 
-            community_name = req_msg.getComponentByPosition(1)
-
-            candidate = select_context(
-                tuple(transport_domain),
-                transport_address[0],
-                community_name.asOctets(),
-            )
-
-            if candidate is not None:
-                if log.enabled(log.LOG_INFO):
-                    log.info(
-                        "Using %s selected by candidate %s; transport ID %s, "
-                        "source address %s, context engine ID <empty>, "
-                        "community name "
-                        '"%s"'
-                        % (
-                            contexts[candidate],
-                            candidate,
-                            univ.ObjectIdentifier(transport_domain),
-                            transport_address[0],
-                            community_name,
-                        )
-                    )
-                community_name = candidate
-
-            else:
-                log.error(
-                    "No data file selected for transport ID %s, source "
-                    "address %s, community name "
-                    '"%s"'
-                    % (
-                        univ.ObjectIdentifier(transport_domain),
-                        transport_address[0],
-                        community_name,
-                    )
-                )
-                return whole_msg
-
-            rsp_msg = p_mod.apiMessage.get_response(req_msg)
-            rsp_pdu = p_mod.apiMessage.get_pdu(rsp_msg)
             req_pdu = p_mod.apiMessage.get_pdu(req_msg)
 
             if req_pdu.isSameTypeWith(p_mod.GetRequestPDU()):
-                backend_fun = contexts[community_name].read_variables
+                pdu_type = fastber.GET_REQUEST
 
             elif req_pdu.isSameTypeWith(p_mod.SetRequestPDU()):
-                backend_fun = contexts[community_name].write_variables
+                pdu_type = SET_REQUEST
 
             elif req_pdu.isSameTypeWith(p_mod.GetNextRequestPDU()):
-                backend_fun = contexts[community_name].read_next_variables
+                pdu_type = fastber.GET_NEXT_REQUEST
 
             elif hasattr(p_mod, "GetBulkRequestPDU") and req_pdu.isSameTypeWith(
                 p_mod.GetBulkRequestPDU()
             ):
-                if not msg_ver:
-                    log.info(
-                        "GETBULK over SNMPv1 from %s:%s"
-                        % (transport_domain, transport_address)
-                    )
-                    return whole_msg
-
-                def backend_fun(*var_binds):
-                    return get_bulk_handler(
-                        var_binds,
-                        p_mod.apiBulkPDU.get_non_repeaters(req_pdu),
-                        p_mod.apiBulkPDU.get_max_repetitions(req_pdu),
-                        contexts[community_name].read_next_variables,
-                    )
+                pdu_type = fastber.GET_BULK_REQUEST
 
             else:
                 log.error(
@@ -500,29 +621,35 @@ def main():
                 )
                 return whole_msg
 
-            try:
-                var_binds = backend_fun(*p_mod.apiPDU.get_varbinds(req_pdu))
+            if pdu_type == fastber.GET_BULK_REQUEST and msg_ver:
+                non_repeaters = p_mod.apiBulkPDU.get_non_repeaters(req_pdu)
+                max_repetitions = p_mod.apiBulkPDU.get_max_repetitions(req_pdu)
 
-            except NoDataNotification:
+            else:
+                non_repeaters = max_repetitions = None
+
+            response = process_request(
+                msg_ver,
+                req_msg.getComponentByPosition(1).asOctets(),
+                pdu_type,
+                p_mod.apiPDU.get_varbinds(req_pdu),
+                non_repeaters,
+                max_repetitions,
+                transport_domain,
+                transport_address,
+            )
+
+            if response is None:
                 return whole_msg
 
-            except Exception as exc:
-                log.error("Ignoring SNMP engine failure: %s" % exc)
-                return whole_msg
+            error_status, error_index, var_binds = response
 
-            if not msg_ver:
-                for idx in range(len(var_binds)):
-                    oid, val = var_binds[idx]
+            rsp_msg = p_mod.apiMessage.get_response(req_msg)
+            rsp_pdu = p_mod.apiMessage.get_pdu(rsp_msg)
 
-                    if val.tagSet in SNMP_2TO1_ERROR_MAP:
-                        var_binds = p_mod.apiPDU.get_varbinds(req_pdu)
-
-                        p_mod.apiPDU.set_error_status(
-                            rsp_pdu, SNMP_2TO1_ERROR_MAP[val.tagSet]
-                        )
-                        p_mod.apiPDU.set_error_index(rsp_pdu, idx + 1)
-
-                        break
+            if error_status:
+                p_mod.apiPDU.set_error_status(rsp_pdu, error_status)
+                p_mod.apiPDU.set_error_index(rsp_pdu, error_index)
 
             p_mod.apiPDU.set_varbinds(rsp_pdu, var_binds)
 
