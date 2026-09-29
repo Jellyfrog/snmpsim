@@ -10,8 +10,14 @@ import sys
 import threading
 
 import pysnmp
-import pysmi
 import pyasn1
+
+try:
+    import pysmi
+
+except ImportError:  # optional, only needed for MIB compilation
+    pysmi = None
+
 import snmpsim
 
 TITLE = """\
@@ -21,7 +27,7 @@ Python interpreter: {}
 Documentation and support at https://www.pysnmp.com/snmpsim
 """.format(
     snmpsim.__version__,
-    pysmi.__version__,
+    pysmi.__version__ if pysmi else "n/a",
     pysnmp.__version__,
     pyasn1.__version__,
     sys.version,
