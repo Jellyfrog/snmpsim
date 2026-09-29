@@ -14,9 +14,11 @@ jobs:
       matrix:
         include:
           - target: snmpsim
-            image: ghcr.io/${{ github.repository }}
+            flavor: ""
+          # the trap receiver is published as tags of the same image
           - target: snmptrapd
-            image: ghcr.io/${{ github.repository }}-snmptrapd
+            flavor: |
+              suffix=-snmptrapd,onlatest=true
     uses: docker/github-builder/.github/workflows/build.yml@58cb9f5b71b1836d6f690c1e95effdeb9b98cb8a # v1.17.0
     permissions:
       contents: read
@@ -32,7 +34,8 @@ jobs:
         linux/arm64=ubuntu-26.04-arm
       cache: true
       cache-mode: max
-      meta-images: ${{ matrix.image }}
+      meta-images: ghcr.io/${{ github.repository }}
+      meta-flavor: ${{ matrix.flavor }}
       set-meta-labels: true
     secrets:
       registry-auths: |

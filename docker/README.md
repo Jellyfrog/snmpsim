@@ -4,9 +4,10 @@ The `Dockerfile` in the repository root builds two images from the snmpsim
 sources in this repository:
 
 * `ghcr.io/jellyfrog/snmpsim` – snmpsim, listening on UDP port `1161`.
-* `ghcr.io/jellyfrog/snmpsim-snmptrapd` – a PySNMP-based trap/inform
+* `ghcr.io/jellyfrog/snmpsim:<tag>-snmptrapd` – a PySNMP-based trap/inform
   receiver inspired by `snmpreceiver/snmptrapd.py`, listening on UDP port `1162`.
-  Both images share the same base layers.
+  It is published as `-snmptrapd` suffixed tags of the same image, and both
+  share the same base layers.
 
 Map the ports to the host ports you want (usually `161` and `162`).
 
@@ -55,7 +56,7 @@ In Kubernetes, set `readOnlyRootFilesystem: true` and mount an `emptyDir` at `/t
 
 ### Trap / Inform receiver
 
-    docker run -p 162:1162/udp ghcr.io/jellyfrog/snmpsim-snmptrapd:master
+    docker run -p 162:1162/udp ghcr.io/jellyfrog/snmpsim:master-snmptrapd
 
 The receiver respects these optional variables:
 
