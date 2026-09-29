@@ -10,6 +10,7 @@ import argparse
 import asyncio
 import functools
 import os
+import socket
 import sys
 import traceback
 
@@ -20,7 +21,6 @@ from pyasn1.type import univ
 from pysnmp import debug as pysnmp_debug
 from pysnmp.carrier.asyncio.dgram import udp
 from pysnmp.carrier.asyncio.dgram import udp6
-from pysnmp.carrier.asyncio.dispatch import AsyncioDispatcher
 from pysnmp.proto import api
 from pysnmp.proto import rfc1902
 from pysnmp.proto import rfc1905
@@ -39,6 +39,9 @@ from snmpsim.error import SnmpsimError
 from snmpsim.reporting.manager import ReportingManager
 
 SET_REQUEST = 0xA3
+
+# fairness between endpoints under load
+MAX_MESSAGES_PER_WAKEUP = 64
 
 NULL = univ.Null("")
 
@@ -567,10 +570,8 @@ def main():
 
             return encoder.encode(rsp_msg)
 
-    def commandResponderCbFun(
-        transport_dispatcher, transport_domain, transport_address, whole_msg
-    ):
-        """v2c arch command responder request handling callback"""
+    def handle_message(send, transport_domain, transport_address, whole_msg):
+        """v2c arch command responder request handling"""
         try:
             rsp = fast_command_responder(transport_domain, transport_address, whole_msg)
 
@@ -579,9 +580,7 @@ def main():
 
         else:
             if rsp is not None:
-                transport_dispatcher.send_message(
-                    rsp, transport_domain, transport_address
-                )
+                send(rsp)
 
             return
 
@@ -653,11 +652,37 @@ def main():
 
             p_mod.apiPDU.set_varbinds(rsp_pdu, var_binds)
 
-            transport_dispatcher.send_message(
-                encoder.encode(rsp_msg), transport_domain, transport_address
-            )
+            send(encoder.encode(rsp_msg))
 
         return whole_msg
+
+    def receive(sock, transport_domain):
+        """Read and answer pending requests on a server socket"""
+        for _ in range(MAX_MESSAGES_PER_WAKEUP):
+            try:
+                whole_msg, transport_address = sock.recvfrom(65535)
+
+            except (BlockingIOError, InterruptedError):
+                return
+
+            except OSError as exc:
+                log.error("Failed to receive on %s: %s" % (sock.getsockname(), exc))
+                return
+
+            def send(data):
+                try:
+                    sock.sendto(data, transport_address)
+
+                except OSError as exc:
+                    log.error(
+                        "Failed to send response to %s: %s" % (transport_address, exc)
+                    )
+
+            try:
+                handle_message(send, transport_domain, transport_address, whole_msg)
+
+            except Exception as exc:
+                log.error("Ignoring request from %s: %s" % (transport_address[0], exc))
 
     # Configure access to data index
 
@@ -677,29 +702,47 @@ def main():
     contexts["index"] = data_index_instrum_controller
 
     # Configure socket server
-    transport_dispatcher = AsyncioDispatcher()
+    loop = asyncio.get_event_loop()
+
+    server_sockets = []
+
+    def open_server_socket(endpoint, transport_domain, ipv6=False):
+        address = endpoints.parse_endpoint(endpoint, ipv6=ipv6)
+
+        sock = socket.socket(
+            socket.AF_INET6 if ipv6 else socket.AF_INET, socket.SOCK_DGRAM
+        )
+
+        try:
+            sock.bind(address)
+
+        except OSError as exc:
+            sock.close()
+            raise SnmpsimError(f"Failed to bind UDP endpoint {endpoint}: {exc}")
+
+        sock.setblocking(False)
+
+        loop.add_reader(sock, receive, sock, transport_domain)
+
+        server_sockets.append(sock)
+
+        log.msg(
+            "Listening at UDP/IPv%s endpoint %s, transport ID "
+            "%s"
+            % (
+                ipv6 and 6 or 4,
+                endpoint,
+                ".".join([str(handler) for handler in transport_domain]),
+            )
+        )
 
     transport_index = args.transport_id_offset
+
     for agent_udpv4_endpoint in args.agent_udpv4_endpoints:
         transport_domain = udp.DOMAIN_NAME + (transport_index,)
         transport_index += 1
 
-        agent_udpv4_endpoint = endpoints.IPv4TransportEndpoints().add(
-            agent_udpv4_endpoint
-        )
-
-        transport_dispatcher.register_transport(
-            transport_domain, agent_udpv4_endpoint[0]
-        )
-
-        log.msg(
-            "Listening at UDP/IPv4 endpoint %s, transport ID "
-            "%s"
-            % (
-                agent_udpv4_endpoint[1],
-                ".".join([str(handler) for handler in transport_domain]),
-            )
-        )
+        open_server_socket(agent_udpv4_endpoint, transport_domain)
 
     transport_index = args.transport_id_offset
 
@@ -707,30 +750,11 @@ def main():
         transport_domain = udp6.DOMAIN_NAME + (transport_index,)
         transport_index += 1
 
-        agent_udpv6_endpoint = endpoints.IPv6TransportEndpoints().add(
-            agent_udpv6_endpoint
-        )
-
-        transport_dispatcher.register_transport(
-            transport_domain, agent_udpv6_endpoint[0]
-        )
-
-        log.msg(
-            "Listening at UDP/IPv6 endpoint %s, transport ID "
-            "%s"
-            % (
-                agent_udpv6_endpoint[1],
-                ".".join([str(handler) for handler in transport_domain]),
-            )
-        )
-
-    transport_dispatcher.register_recv_callback(commandResponderCbFun)
-
-    transport_dispatcher.job_started(1)  # server job would never finish
+        open_server_socket(agent_udpv6_endpoint, transport_domain, ipv6=True)
 
     with daemon.PrivilegesOf(args.process_user, args.process_group, final=True):
         try:
-            transport_dispatcher.run_dispatcher()
+            loop.run_forever()
 
         except KeyboardInterrupt:
             log.info("Shutting down process...")
@@ -752,7 +776,9 @@ def main():
                     else:
                         log.info('Variation module "%s" shutdown OK' % name)
 
-            transport_dispatcher.close_dispatcher()
+            for sock in server_sockets:
+                loop.remove_reader(sock)
+                sock.close()
 
             log.info("Process terminated")
 
