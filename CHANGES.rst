@@ -1,5 +1,11 @@
 .. current-version: 1.2.2 (managed by bump2version)
 
+Unreleased
+----------
+
+- Added a chaos mode to the lite command responder: the --chaos and
+  --chaos-rate options make it misbehave like buggy SNMP agents do.
+
 Revision 1.2.2, released on Apr 26, 2026
 ----------------------------------------
 
