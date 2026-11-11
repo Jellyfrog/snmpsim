@@ -47,8 +47,8 @@ MAX_MESSAGES_PER_WAKEUP = 64
 
 NULL = univ.Null("")
 
-# Max UDP payload (65507) minus message, community and PDU headers
-MAX_BULK_RESPONSE_SIZE = 65507 - 512
+# Largest UDP/IPv4 payload
+MAX_MESSAGE_SIZE = 65507
 
 SNMP_2TO1_ERROR_MAP = {
     rfc1902.Counter64.tagSet: 5,
@@ -484,11 +484,28 @@ def main():
             var_binds = rsp_var_binds[-R:]
             M -= 1
 
-        # Send fewer var-binds rather than an oversized datagram
-        # (RFC 3416, 4.2.3)
-        return utils.fit_var_binds(
-            rsp_var_binds, MAX_BULK_RESPONSE_SIZE, min_count=max(N, 1)
+        return rsp_var_binds
+
+    def encode_fitting(encode, pdu_type, non_repeaters, var_binds):
+        """Encode response, dropping trailing GETBULK var-binds if too big.
+
+        RFC 3416, 4.2.3: a GETBULK response that would not fit in a message
+        is sent with fewer var-binds rather than not at all. Only oversized
+        responses pay for this, the size is checked after encoding.
+        """
+        rsp = encode(var_binds)
+
+        if len(rsp) <= MAX_MESSAGE_SIZE or pdu_type != fastber.GET_BULK_REQUEST:
+            return rsp
+
+        # message and PDU headers, plus room for their length octets to grow
+        budget = MAX_MESSAGE_SIZE - len(encode([])) - 16
+
+        var_binds = utils.fit_var_binds(
+            var_binds, budget, min_count=max(int(non_repeaters or 0), 1)
         )
+
+        return encode(var_binds)
 
     @functools.lru_cache(maxsize=4096)
     def select_context(transport_domain, source_address, community_name):
@@ -628,17 +645,21 @@ def main():
 
         error_status, error_index, var_binds = response
 
-        try:
-            return fastber.encode_response(
-                msg_ver,
-                community_name,
-                request_id,
-                error_status,
-                error_index,
-                var_binds,
-            )
+        def encode(var_binds):
+            try:
+                return fastber.encode_response(
+                    msg_ver,
+                    community_name,
+                    request_id,
+                    error_status,
+                    error_index,
+                    var_binds,
+                )
 
-        except Exception:
+            except Exception:
+                return encode_with_pyasn1(var_binds)
+
+        def encode_with_pyasn1(var_binds):
             # unusual response contents, let pysnmp encode it
             p_mod = api.PROTOCOL_MODULES[msg_ver]
 
@@ -657,6 +678,8 @@ def main():
             p_mod.apiMessage.set_pdu(rsp_msg, rsp_pdu)
 
             return encoder.encode(rsp_msg)
+
+        return encode_fitting(encode, pdu_type, non_repeaters, var_binds)
 
     def handle_message(send, transport_domain, transport_address, whole_msg):
         """v2c arch command responder request handling"""
@@ -738,9 +761,11 @@ def main():
                 p_mod.apiPDU.set_error_status(rsp_pdu, error_status)
                 p_mod.apiPDU.set_error_index(rsp_pdu, error_index)
 
-            p_mod.apiPDU.set_varbinds(rsp_pdu, var_binds)
+            def encode(var_binds):
+                p_mod.apiPDU.set_varbinds(rsp_pdu, var_binds)
+                return encoder.encode(rsp_msg)
 
-            send(encoder.encode(rsp_msg))
+            send(encode_fitting(encode, pdu_type, non_repeaters, var_binds))
 
         return whole_msg
 
