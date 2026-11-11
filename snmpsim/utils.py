@@ -141,15 +141,64 @@ def run_in_new_loop(coroutine):
     return result
 
 
-def _varbind_size(oid, value):
-    """Return an upper bound of the BER-encoded size of a single var-bind"""
+
+def _tlv_size(length):
+    """Size of a BER TLV with a one-octet tag and `length` octets of value"""
+    return 2 + length if length < 0x80 else 2 + (length.bit_length() + 7) // 8 + length
+
+
+def _oid_size_bound(oid):
+    arcs = len(oid)
+
+    # sub-identifiers below 2**35 take at most 5 octets
+    if not arcs or max(oid) < 0x800000000:
+        return 5 * arcs
+
+    return sum((arc.bit_length() + 6) // 7 or 1 for arc in oid)
+
+
+def _varbind_size_bound(var_bind):
+    """Cheap upper bound of the BER-encoded size of a var-bind"""
+    encoded = getattr(var_bind, "encoded", None)
+
+    if encoded is not None:
+        return len(encoded)
+
+    from pyasn1.type import univ
+
+    oid, value = var_bind
+
+    if not value.isValue:
+        value_size = 0  # e.g. an exception value such as endOfMibView
+
+    elif isinstance(value, univ.ObjectIdentifier):
+        value_size = _oid_size_bound(value)
+
+    elif isinstance(value, univ.OctetString):
+        value_size = len(value)
+
+    else:
+        # INTEGER-based SNMP types take at most 9 octets, NULL-likes none
+        value_size = 9
+
+    return _tlv_size(_tlv_size(_oid_size_bound(oid)) + _tlv_size(value_size))
+
+
+def _varbind_size(var_bind):
+    """BER-encoded size of a single var-bind"""
+    encoded = getattr(var_bind, "encoded", None)
+
+    if encoded is not None:
+        return len(encoded)
+
     from pyasn1.codec.ber import encoder
     from pysnmp.proto import rfc1902
 
-    body = len(encoder.encode(rfc1902.ObjectName(oid))) + len(encoder.encode(value))
+    oid, value = var_bind
 
-    # SEQUENCE tag + length octets
-    return body + 1 + (1 if body < 0x80 else 1 + (body.bit_length() + 7) // 8)
+    return _tlv_size(
+        len(encoder.encode(rfc1902.ObjectName(oid))) + len(encoder.encode(value))
+    )
 
 
 def fit_var_binds(var_binds, max_size, min_count=0):
@@ -159,10 +208,14 @@ def fit_var_binds(var_binds, max_size, min_count=0):
     the response is generated with a lesser number of variable bindings.
     At least `min_count` var-binds are always kept.
     """
+    # the common case: cheap estimate shows it fits, nothing is encoded
+    if sum(map(_varbind_size_bound, var_binds)) <= max_size:
+        return var_binds
+
     total = 0
 
-    for idx, (oid, value) in enumerate(var_binds):
-        total += _varbind_size(oid, value)
+    for idx, var_bind in enumerate(var_binds):
+        total += _varbind_size(var_bind)
 
         if total > max_size and idx >= min_count:
             return var_binds[:idx]
